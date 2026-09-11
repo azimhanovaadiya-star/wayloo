@@ -28,7 +28,7 @@ const INTENT_LABEL: Record<Intent, string> = {
   GENERAL_VISUAL_QUERY: "General",
 };
 
-const STATUS: Record<string, { text: string; tone: string }> = {
+const STATUS: Record<string, { label: string; hint: string }> = {
   idle: { label: "Ready — ask me anything", hint: "text-muted" },
   listening: { label: "Listening…", hint: "text-primary animate-listen" },
   analyzing: { label: "Understanding what I see…", hint: "text-primary" },

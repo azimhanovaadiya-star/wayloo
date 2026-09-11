@@ -148,7 +148,7 @@ export class SpeechService {
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const ctx = new Ctor();
     await ctx.resume();
-    const source = ctx.createMediaStreamSource(stream);
+    ctx.createMediaStreamSource(stream);
     const processor = ctx.createScriptProcessor(4096, 1, 1);
     const mute = ctx.createGain();
     mute.gain.value = 0;

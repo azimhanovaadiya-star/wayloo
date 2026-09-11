@@ -6,7 +6,7 @@
  * SiMa Pal toolchain → device inference → identical input/output contract).
  */
 
-import type { RawDetection, VisionEngine, VisionBackendId } from "../../types";
+import type { RawDetection, VisionEngine, VisionBackendId } from "../../../types";
 
 export class SiMaVisionEngine implements VisionEngine {
   readonly id: VisionBackendId = "sima";

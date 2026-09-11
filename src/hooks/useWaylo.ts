@@ -4,7 +4,6 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { RefObject } from "react";
 import type { Scene, WayloError, WayloResponse, WayloState, WayloTurn } from "../types";
 import { cameraService } from "../services/camera/CameraService";
 import { speechService } from "../services/speech/SpeechService";
@@ -25,7 +24,7 @@ export interface WayloController {
   lastScene: Scene | null;
   errors: WayloError[];
   demoMode: boolean;
-  videoRef: RefObject<HTMLVideoElement | null>;
+  videoRef: { current: HTMLVideoElement | null };
   vision: { backend: VisionEngine["id"]; modelLabel: string; ready: boolean };
   live: { cameraOn: boolean; micUsable: boolean };
   ttsAvailable: boolean;

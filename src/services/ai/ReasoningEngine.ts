@@ -130,7 +130,7 @@ function sceneDescription(scene: Scene): WayloResponse {
   }
   return {
     intent: "SCENE_DESCRIPTION",
-    text: `In front of you I see ${joinObjects(parts)}.`,
+    text: `In front of you I see ${joinList(parts)}.`,
     referencedObjects: top,
     isMiss: false,
   };
@@ -249,7 +249,7 @@ function generalAnswer(scene: Scene): WayResponse {
     };
   }
   const top = scene.objects.slice(0, 3);
-  const names = joinObjects(top.map((o) => objectCountWord(1) + " " + o.name));
+  const names = joinList(top.map((o) => objectCountWord(1) + " " + o.name));
   return {
     intent: "GENERAL_VISUAL_QUERY",
     text: `Right now I can see ${names}. Ask me "where is" one of them and I'll point it out.`,

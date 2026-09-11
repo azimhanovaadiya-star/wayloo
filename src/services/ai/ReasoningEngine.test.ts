@@ -17,7 +17,7 @@ import type { Scene, WayloTurn } from "../../types";
 function sceneWith(objects: Array<[string, number, number]>): Scene {
   return {
     timestamp: new Date().toISOString(),
-    objects: objects.map(([name, cx, area], i) => ({
+    objects: objects.map(([name, cx, area]) => ({
       name,
       confidence: 0.9,
       bbox: [cx, 100, cx + 100, 300],
@@ -138,13 +138,6 @@ describe("context — follow-up questions", () => {
 describe("read-text is honestly deferred", () => {
   it("does not pretend to OCR", () => {
     const r = synthesizeResponse("Read the sign for me", sceneWith([]));
-    expect(r.text.toLowerCase()).toContain("not available");
+    expect(r.text.toLowerCase()).toContain("isn't available");
   });
 });
-
-function synthesizeResponseLifted(query: string, scene: Scene, ctx?: { history: WayloTurn[] }) {
-  return synthesizeResponse(query, scene, ctx);
-}
-
-const temp = synthesizeResponseLifted;
-void temp;
