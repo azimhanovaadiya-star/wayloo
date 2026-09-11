@@ -1,9 +1,17 @@
+/**
+ * WAYLO — edge AI voice & vision companion.
+ * Screens: Start (landing) → Main (the live loop).
+ */
+
+import { useWaylo } from "./hooks/useWaylo";
+import { StartScreen } from "./components/StartScreen";
+import { MainScreen } from "./components/MainScreen";
+
 export default function App() {
-  return (
-    <div className="min-h-screen bg-dotgrid-glow flex items-center justify-center">
-      <p className="text-md text-text-muted tracking-wide select-none">
-        Your app will be here
-      </p>
-    </div>
-  );
+  const waylo = useWaylo();
+
+  if (waylo.screen === "start") {
+    return <StartScreen onStart={waylo.start} />;
+  }
+  return <MainScreen c={waylo} />;
 }

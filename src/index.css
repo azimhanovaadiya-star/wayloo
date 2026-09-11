@@ -1,26 +1,138 @@
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap');
 @import "tailwindcss";
 
-/* THESE ARE PLACEHOLDER FOR EMPTY APP, FEEL FREE TO REPLACE WITH DESIRED DESIGN */
+/* WAYLO design tokens — black + amber high-contrast palette (low-vision friendly).
+   The generated system defaulted to muted grays; the user's explicit black/amber
+   preference wins, see design-system/MASTER.md. Do NOT reorder the @import/@theme. */
 
 @theme {
-  --font-sans: ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --color-text-muted: oklch(0.9015 0.0154 241.79);
+  --font-sans: "Space Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-heading: "Space Grotesk", ui-sans-serif, system-ui, -apple-system, sans-serif;
+
+  --color-primary: #f5b700;
+  --color-primary-soft: #ffc700;
+  --color-on-primary: #0a0a0a;
+  --color-background: #0a0a0a;
+  --color-surface: #141414;
+  --color-surface-2: #1c1c1c;
+  --color-foreground: #f2f2f2;
+  --color-muted: #9a9a9a;
+  --color-border: #2e2e2e;
+  --color-destructive: #e5484d;
+  --color-ring: #f5b700;
+
+  --radius-lg: 0.875rem;
+  --radius-xl: 1.25rem;
+
+  --animate-listen: listen 1.6s ease-in-out infinite;
+  --animate-pulse-dot: pulse-dot 1.6s ease-in-out infinite;
+
+  @keyframes listen {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.45; }
+  }
+
+  @keyframes pulse-dot {
+    0%, 100% { transform: scale(1); opacity: 1; }
+    50% { transform: scale(1.35); opacity: 0.6; }
+  }
 }
 
-.bg-dotgrid-glow {
-  background-color: oklch(0.1638 0 0);
-  background-image:
-    radial-gradient(
-      circle at 50% 118%,
-      oklch(0.41 0.14 250 / 45%) 0%,
-      oklch(0.41 0.14 250 / 22%) 22%,
-      oklch(0.41 0.14 250 / 10%) 32%,
-      oklch(0.41 0.14 250 / 4%) 38%,
-      transparent 45%
-    ),
-    radial-gradient(oklch(0.41 0.14 250 / 4%) 1px, transparent 1px);
-  background-size:
-    100% 100%,
-    16px 16px;
-  background-position: center, center;
+html {
+  background-color: #0a0a0a;
+  color: #f2f2f2;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  font-family: var(--font-sans);
+  min-height: 100vh;
+}
+
+::selection {
+  background: #f5b700;
+  color: #0a0a0a;
+}
+
+/* Visible, high-contrast focus */
+:focus-visible {
+  outline: 3px solid #f5b700;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Big, satisfying primary buttons */
+.btn-primary {
+  background-color: #f5b700;
+  color: #0a0a0a;
+  font-weight: 700;
+  border-radius: 9999px;
+  padding: 1.125rem 2.5rem;
+  min-height: 3.5rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.625rem;
+  transition: transform 150ms ease-out, box-shadow 150ms ease-out, background-color 150ms ease-out;
+}
+.btn-primary:hover {
+  background-color: #ffc700;
+}
+.btn-primary:active {
+  transform: scale(0.97);
+}
+@media (hover: hover) and (pointer: fine) {
+  .btn-primary:hover { box-shadow: 0 0 22px rgb(245 183 0 / 0.45); }
+}
+
+.btn-ghost {
+  background-color: transparent;
+  color: #f2f2f2;
+  border: 2px solid #2e2e2e;
+  font-weight: 600;
+  border-radius: 9999px;
+  padding: 0.875rem 1.75rem;
+  min-height: 3.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  transition: border-color 150ms ease-out, background-color 150ms ease-out, transform 150ms ease-out;
+}
+.btn-ghost:hover { border-color: #f5b700; }
+.btn-ghost:active { transform: scale(0.97); }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  border-radius: 9999px;
+  border: 1px solid #2e2e2e;
+  background: #141414;
+  color: #e8e8e8;
+  padding: 0.625rem 1.25rem;
+  font-size: 1rem;
+  min-height: 3rem;
+  transition: border-color 150ms ease-out, background-color 150ms ease-out, transform 150ms ease-out;
+}
+.chip:hover { border-color: #f5b700; background: #1c1c1c; }
+.chip:active { transform: scale(0.97); }
+
+.panel {
+  background: #141414;
+  border: 1px solid #2e2e2e;
+  border-radius: 0.875rem;
+}
+
+.amber-glow-text {
+  text-shadow: 0 0 24px rgba(245, 183, 0, 0.55);
+}
+
+/* Respect reduced-motion preferences */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }
