@@ -115,8 +115,17 @@ export function MainScreen({ c }: { c: WayloController }) {
                 <Camera className="h-10 w-10 text-muted" aria-hidden="true" />
                 <p className="text-muted text-lg">Camera isn't available right now.</p>
                 <p className="text-muted/80 text-sm max-w-sm">
-                  Check the browser permission, or keep using WAYLO with typed questions.
+                  Check the browser permission, then retry. WAYLO still works with typed questions.
                 </p>
+                <button
+                  type="button"
+                  onClick={() => c.retryCamera()}
+                  className="btn-ghost !py-2 !px-4 text-sm"
+                  aria-label="Try starting the camera again"
+                >
+                  <Camera className="h-4 w-4" aria-hidden="true" />
+                  Try camera again
+                </button>
               </div>
             )}
           </div>

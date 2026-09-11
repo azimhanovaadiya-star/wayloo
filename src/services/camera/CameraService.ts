@@ -11,6 +11,8 @@ export class CameraService {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error("Camera access is not supported in this browser.");
     }
+    // Release any previous stream before re-acquiring (handles retries + effect re-runs).
+    this.stop(video);
     const stream = await navigator.mediaDevices.getUserMedia({
       video: {
         facingMode: "user",

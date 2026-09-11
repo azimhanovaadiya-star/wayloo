@@ -33,6 +33,7 @@ export interface WayloController {
   stopListening: () => Promise<void>;
   ask: (query: string) => Promise<void>;
   quit: () => Promise<void>;
+  retryCamera: () => void;
   setDemoMode: (on: boolean) => void;
   dismissError: (id: number) => void;
 }
@@ -40,6 +41,20 @@ export interface WayloController {
 function messageOf(err: unknown, fallback = "Something went wrong — please try again."): string {
   if (err instanceof Error && err.message) return err.message;
   return fallback;
+}
+
+/** Human-readable guidance for a failed getUserMedia attempt. */
+function cameraErrorMessage(err: unknown): string {
+  const name = (err as DOMException | null)?.name ?? (err as Error | null)?.name ?? "";
+  if (name === "NotAllowedError" || name === "SecurityError") {
+    return "Camera access was denied — allow it for this site, then try again.";
+  }
+  if (name === "NotFoundError" || name === "OverconstrainedError") {
+    return "No camera was found on this device — WAYLO still works with typed questions.";
+  }
+  const message = messageOf(err, "");
+  if (message.includes("not supported")) return message;
+  return "I couldn't start the camera right now — try again or use typed questions.";
 }
 
 export function useWaylo(): WayloController {
@@ -51,6 +66,7 @@ export function useWaylo(): WayloController {
   const [errors, setErrors] = useState<WayloError[]>([]);
   const [demoMode, setDemoModeFlag] = useState(false);
   const [cameraOn, setCameraOn] = useState(false);
+  const [cameraAttempt, setCameraAttempt] = useState(0);
   const [micUsable, setMicUsable] = useState(true);
   const [engineReady, setEngineReady] = useState(false);
 
@@ -164,7 +180,8 @@ export function useWaylo(): WayloController {
     [addError, getTts]
   );
 
-  /** Permission + model + camera warm-up. Safe to call repeatedly. */
+  /** Warm the vision model, then move to the main screen.
+   * The camera itself starts in a mount effect once the <video> exists (see below). */
   const start = useCallback(async () => {
     const engine = engineRef.current ?? (engineRef.current = createVisionEngine());
     try {
@@ -172,18 +189,6 @@ export function useWaylo(): WayloController {
       setEngineReady(true);
     } catch {
       addError("vision", "The on-device vision model couldn't load. Check your connection and try again.");
-    }
-
-    const video = videoRef.current;
-    if (video) {
-      try {
-        await cameraService.start(video);
-        setCameraOn(true);
-      } catch {
-        cameraService.stop(video);
-        setCameraOn(false);
-        addError("camera", "I can't access the camera right now — please allow camera access and try again.");
-      }
     }
     setScreen("main");
   }, [addError]);
@@ -252,6 +257,35 @@ export function useWaylo(): WayloController {
     setDemoModeFlag(on);
   }, []);
 
+  /** Re-attempt camera acquisition (from the "Try camera again" button). */
+  const retryCamera = useCallback(() => {
+    setCameraAttempt((n) => n + 1);
+  }, []);
+
+  // Camera startup: runs once the MainScreen <video> is mounted (screen === "main").
+  // Previously this lived inside start(), where the video element didn't exist yet
+  // (MainScreen mounts after setScreen("main")) — so the camera was never requested.
+  useEffect(() => {
+    if (screen !== "main" || cameraOn) return;
+    const video = videoRef.current;
+    if (!video) return;
+    let cancelled = false;
+    (async () => {
+      if (cancelled) return;
+      try {
+        await cameraService.start(video);
+        if (!cancelled && videoRef.current === video) setCameraOn(true);
+      } catch (err) {
+        if (cancelled) return;
+        setCameraOn(false);
+        addError("camera", cameraErrorMessage(err));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [screen, cameraOn, cameraAttempt, addError]);
+
   // Live camera watchdog while on the main screen.
   useEffect(() => {
     if (screen !== "main") return;
@@ -319,6 +353,7 @@ export function useWaylo(): WayloController {
     stopListening,
     ask,
     quit,
+    retryCamera,
     setDemoMode,
     dismissError,
   };
