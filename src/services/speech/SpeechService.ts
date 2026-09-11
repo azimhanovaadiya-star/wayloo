@@ -4,7 +4,19 @@
  * typed SpeechEvents (PRD §1 abstraction rule).
  *
  * Flow: fetch a fresh JWT from the Supabase Edge Function (the secret never
- * touches client code) → open the WebSocket → stream 16 kHz PCM from the mic.
+ * touches client code) → open the WebSocket → wait for `RecognitionStarted` →
+ * stream 16 kHz mono PCM from the mic.
+ *
+ * Audio graph — the path that actually carries sound to Speechmatics:
+ *   microphone → MediaStreamAudioSourceNode → ScriptProcessorNode (onaudioprocess
+ *   resamples each chunk to 16 kHz pcm_s16le and sends it over the WebSocket)
+ *   → muted GainNode → AudioContext destination (muted so the user is not
+ *   echo-monitored). The source MUST be connected to the processor, otherwise
+ *   onaudioprocess never receives any microphone samples.
+ *
+ * Contains temporary development-only logging (console.debug, active only when
+ * import.meta.env.DEV is true — stripped from production builds). It never
+ * logs the JWT, the WebSocket URL (which embeds the JWT), or any secret.
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -13,6 +25,11 @@ import { STT_IDLE_TIMEOUT_MS, STT_LANGUAGE, STT_MAX_UTTERANCE_MS } from "../../c
 
 const WS_ENDPOINT = "wss://eu.rt.speechmatics.com/v2";
 const TARGET_RATE = 16000;
+
+/** Dev-only diagnostics. Never logs URLs, tokens, or secrets. */
+function devLog(...parts: unknown[]): void {
+  if (import.meta.env.DEV) console.debug("[WAYLO Speech]", ...parts);
+}
 
 let supabase: SupabaseClient | null = null;
 
@@ -68,16 +85,27 @@ function makeResampler(srcRate: number): (input: Float32Array) => Int16Array {
 
 async function getMicStream(): Promise<MediaStream> {
   if (!navigator.mediaDevices?.getUserMedia) {
+    devLog("mic permission DENIED — getUserMedia unsupported");
     throw new Error("Microphone access is not supported in this browser.");
   }
-  return navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-  });
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
+    devLog("mic permission GRANTED", `audio tracks: ${stream.getAudioTracks().length}`);
+    return stream;
+  } catch (err) {
+    const detail =
+      err instanceof DOMException ? err.name : err instanceof Error ? err.message : String(err);
+    devLog("mic permission DENIED", detail);
+    throw new Error("Microphone access was denied. Allow microphone access and try again.");
+  }
 }
 
 interface ActiveSession {
   ws: WebSocket;
   ctx: AudioContext;
+  source: MediaStreamAudioSourceNode;
   processor: ScriptProcessorNode;
   stream: MediaStream;
   onEvent: (e: SpeechEvent) => void;
@@ -88,21 +116,46 @@ interface ActiveSession {
   timers: ReturnType<typeof setTimeout>[];
 }
 
-function transcriptOf(msg: Record<string, unknown>): string {
-  const meta = (msg.metadata ?? {}) as Record<string, unknown>;
-  if (typeof meta.transcript === "string" && meta.transcript.trim()) return meta.transcript.trim();
-  if (typeof msg.transcript === "string" && msg.transcript.trim()) return msg.transcript.trim();
+interface WordResult {
+  type?: string;
+  content?: string;
+  transcript?: string;
+  alternatives?: Array<{ content?: string; transcript?: string; text?: string }>;
+}
+
+/**
+ * Extract the recognition text from a Speechmatics v2 message. Handles both
+ * the aggregated `metadata.transcript` form and raw word-level results
+ * (`results[].alternatives[].content`).
+ */
+export function transcriptOf(msg: Record<string, unknown>): string {
+  const metadata = (msg.metadata ?? {}) as Record<string, unknown>;
+  if (typeof metadata.transcript === "string" && metadata.transcript.trim()) {
+    return metadata.transcript.trim();
+  }
+  if (typeof msg.transcript === "string" && msg.transcript.trim()) {
+    return msg.transcript.trim();
+  }
   const results = msg.results;
   if (Array.isArray(results)) {
-    return results
-      .map((r) => {
-        const row = r as { transcript?: string; alternatives?: Array<{ transcript?: string }> };
-        return row.transcript ?? row.alternatives?.[0]?.transcript ?? "";
-      })
-      .join(" ")
-      .trim();
+    const words: string[] = [];
+    for (const r of results) {
+      const row = r as WordResult;
+      const alt = row.alternatives?.[0];
+      const candidate = row.content ?? row.transcript ?? alt?.content ?? alt?.transcript ?? alt?.text ?? "";
+      if (typeof candidate === "string" && candidate.trim()) words.push(candidate.trim());
+    }
+    if (words.length > 0) return words.join(" ").trim();
   }
   return "";
+}
+
+/** Safe (non-secret) description of a Speechmatics error message. */
+function errorDetail(msg: Record<string, unknown>): string {
+  const reason = typeof msg.reason === "string" ? msg.reason : undefined;
+  const type = typeof msg.type === "string" ? msg.type : undefined;
+  const code = typeof msg.code === "string" ? msg.code : undefined;
+  return [type, code, reason].filter((v): v is string => Boolean(v)).join(" | ") || "unknown error";
 }
 
 export class SpeechService {
@@ -118,18 +171,21 @@ export class SpeechService {
   }): Promise<void> {
     await this.stop();
 
-    const { token } = await fetchToken();
+    const { token } = await fetchToken(); // never logged
     const startedAt = performance.now();
     const ws = new WebSocket(`${WS_ENDPOINT}?jwt=${token}`);
+    ws.binaryType = "arraybuffer";
 
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("Could not reach the speech service.")), 10_000);
       ws.onopen = () => {
         clearTimeout(timer);
+        devLog("WebSocket OPENED");
         resolve();
       };
       ws.onerror = () => {
         clearTimeout(timer);
+        devLog("WebSocket error — connection failed");
         reject(new Error("Could not reach the speech service."));
       };
     });
@@ -142,22 +198,110 @@ export class SpeechService {
       })
     );
 
-    const stream = await getMicStream();
+    // `session`/`recognitionStarted` must exist before `ws.onmessage` is set so
+    // a fast RecognitionStarted can never be missed while the mic is starting.
+    let session: ActiveSession | null = null;
+    let recognitionStarted = false;
+
+    ws.onmessage = (ev) => {
+      if (typeof ev.data !== "string") return; // server sends JSON only
+      let msg: Record<string, unknown>;
+      try {
+        msg = JSON.parse(ev.data) as Record<string, unknown>;
+      } catch {
+        return;
+      }
+      const kind = typeof msg.message === "string" ? msg.message : "";
+      const text = transcriptOf(msg);
+
+      switch (kind) {
+        case "RecognitionStarted":
+          // Gate: do not stream any mic audio until the session is live.
+          recognitionStarted = true;
+          devLog("RecognitionStarted received");
+          break;
+
+        case "AddPartialTranscript":
+          devLog("AddPartialTranscript received", text ? `"${text}"` : "(no text yet)");
+          if (!session || session.tornDown) return;
+          if (text) opts.onEvent({ type: "partial", text });
+          break;
+
+        case "AddTranscript":
+          devLog("AddTranscript received", text ? `"${text}"` : "(empty)");
+          if (!session || session.tornDown) return;
+          if (text) {
+            session.gotAnything = true;
+            const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
+            opts.onEvent({ type: "final", text, durationMs });
+            opts.onFinal(text, durationMs);
+            void this.stop();
+          }
+          break;
+
+        case "EndOfTranscript":
+          devLog("EndOfTranscript received");
+          break;
+
+        case "Error":
+          devLog("Speechmatics error:", errorDetail(msg));
+          if (session) {
+            opts.onEvent({ type: "error", message: "The speech service reported a problem. Please try again." });
+            void this.stop();
+          } else {
+            try {
+              ws.close();
+            } catch {
+              /* noop */
+            }
+          }
+          break;
+
+        default:
+          // Unknown keep-alive / system messages are ignored.
+          break;
+      }
+    };
+
+    ws.onclose = () => {
+      devLog("WebSocket CLOSED");
+      if (session) this.teardown(session);
+    };
+
+    let stream: MediaStream;
+    try {
+      stream = await getMicStream();
+    } catch (err) {
+      try {
+        ws.close();
+      } catch {
+        /* noop */
+      }
+      throw err;
+    }
+
     const Ctor =
       window.AudioContext ??
       (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const ctx = new Ctor();
     await ctx.resume();
-    ctx.createMediaStreamSource(stream);
+    devLog("AudioContext sample rate:", ctx.sampleRate, "Hz");
+
+    // Build the muted graph. CRITICAL: the MediaStreamSourceNode's return value
+    // is stored and connected to the ScriptProcessor, otherwise the processor
+    // never receives any microphone audio.
+    const source = ctx.createMediaStreamSource(stream);
     const processor = ctx.createScriptProcessor(4096, 1, 1);
     const mute = ctx.createGain();
     mute.gain.value = 0;
+    source.connect(processor);
     processor.connect(mute);
     mute.connect(ctx.destination);
 
-    const session: ActiveSession = {
+    session = {
       ws,
       ctx,
+      source,
       processor,
       stream,
       onEvent: opts.onEvent,
@@ -171,49 +315,12 @@ export class SpeechService {
 
     const resample = makeResampler(ctx.sampleRate);
     processor.onaudioprocess = (e) => {
-      if (this.session !== session || session.tornDown) return;
+      if (!session || session.tornDown) return;
+      if (!recognitionStarted) return; // no audio until RecognitionStarted
       const pcm = resample(e.inputBuffer.getChannelData(0));
-      if (pcm.length > 0 && ws.readyState === WebSocket.OPEN) {
-        ws.send(new Blob([pcm.buffer as ArrayBuffer], { type: "application/octet-stream" }));
-      }
-    };
-
-    ws.onmessage = (ev) => {
-      if (this.session !== session || session.tornDown) return;
-      if (typeof ev.data !== "string") return;
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(ev.data);
-      } catch {
-        return;
-      }
-      const kind = String(msg.message ?? msg.type ?? "");
-      const text = transcriptOf(msg);
-
-      if (/recognition-started/.test(kind)) {
-        opts.onEvent({ type: "started" });
-        return;
-      }
-      if (/partial/.test(kind) && text) {
-        opts.onEvent({ type: "partial", text });
-        return;
-      }
-      if (/transcript/i.test(kind) && text) {
-        session.gotAnything = true;
-        const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
-        opts.onEvent({ type: "final", text, durationMs });
-        opts.onFinal(text, durationMs);
-        void this.stop();
-        return;
-      }
-      if (kind === "error" || msg.error) {
-        opts.onEvent({ type: "error", message: "The speech service reported a problem. Please try again." });
-        void this.stop();
-      }
-    };
-
-    ws.onclose = () => {
-      if (this.session === session) this.teardown(session);
+      if (pcm.length === 0 || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(pcm.buffer as ArrayBuffer);
+      devLog("PCM chunk sent:", pcm.byteLength, "bytes");
     };
 
     // Fallback timers: idle-silence gate + hard utterance cap.
@@ -252,15 +359,31 @@ export class SpeechService {
     session.tornDown = true;
     if (this.session === session) this.session = null;
     session.timers.forEach(clearTimeout);
+
+    // 1) Stop the microphone tracks.
+    devLog("Stopping microphone tracks");
+    session.stream.getTracks().forEach((t) => t.stop());
+
+    // 2) Disconnect the Web Audio graph: source then processor.
     try {
+      session.source.disconnect();
+    } catch {
+      /* noop */
+    }
+    try {
+      session.processor.onaudioprocess = null;
       session.processor.disconnect();
     } catch {
       /* noop */
     }
-    session.stream.getTracks().forEach((t) => t.stop());
+
+    // 3) Close the AudioContext.
     void session.ctx.close().catch(() => undefined);
+
+    // 4) Close the WebSocket.
     try {
       if (session.ws.readyState === WebSocket.OPEN || session.ws.readyState === WebSocket.CONNECTING) {
+        devLog("Closing WebSocket");
         session.ws.close();
       }
     } catch {
