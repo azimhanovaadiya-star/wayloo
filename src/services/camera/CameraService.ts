@@ -6,29 +6,36 @@
 export class CameraService {
   private stream: MediaStream | null = null;
 
-  /** Request the user-facing camera. Throws with a human-readable message on failure. */
+  /** Request the camera. Throws with a human-readable message on failure. */
   async start(video: HTMLVideoElement): Promise<void> {
+    console.log("[WAYLO CAMERA] start() called");
     if (!navigator.mediaDevices?.getUserMedia) {
+      console.error("[WAYLO CAMERA] getUserMedia unavailable");
       throw new Error("Camera access is not supported in this browser.");
     }
-    // Release any previous stream before re-acquiring (handles retries + effect re-runs).
-    this.stop(video);
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: {
-        facingMode: "user",
-        width: { ideal: 1280 },
-        height: { ideal: 720 },
-      },
-    });
-    this.stream = stream;
-    video.srcObject = stream;
-    await video.play().catch(() => undefined);
-    // Occasionally readyState lags the play() promise on first attach.
-    await new Promise<void>((resolve) => {
-      if (video.readyState >= 2) return resolve();
-      const check = () => (video.readyState >= 2 ? resolve() : setTimeout(check, 50));
-      check();
-    });
+    console.log("[WAYLO CAMERA] requesting permission...");
+    try {
+      this.stop(video);
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
+      });
+      console.log("[WAYLO CAMERA] permission granted", stream.getVideoTracks());
+      this.stream = stream;
+      video.srcObject = stream;
+      await video.play();
+      console.log("[WAYLO CAMERA] video playing", {
+        width: video.videoWidth,
+        height: video.videoHeight,
+        readyState: video.readyState,
+      });
+    } catch (error) {
+      console.error("[WAYLO CAMERA] FAILED:", error);
+      throw error;
+    }
   }
 
   /** True when both the stream and the video element are actively rendering. */
