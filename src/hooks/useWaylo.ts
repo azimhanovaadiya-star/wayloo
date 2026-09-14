@@ -26,7 +26,7 @@ export interface WayloController {
   demoMode: boolean;
   videoRef: { current: HTMLVideoElement | null };
   vision: { backend: VisionEngine["id"]; modelLabel: string; ready: boolean };
-  live: { cameraOn: boolean; micUsable: boolean };
+  live: { cameraOn: boolean; cameraStarting: boolean; micUsable: boolean };
   ttsAvailable: boolean;
   start: () => Promise<void>;
   listen: () => Promise<void>;
@@ -43,7 +43,9 @@ function messageOf(err: unknown, fallback = "Something went wrong — please try
   return fallback;
 }
 
-/** Human-readable guidance for a failed getUserMedia attempt. */
+/** Human-readable guidance for a failed getUserMedia attempt.
+ * In development the actual error name/message is surfaced so a failed camera
+ * request is diagnosable instead of being silently flattened to a generic line. */
 function cameraErrorMessage(err: unknown): string {
   const name = (err as DOMException | null)?.name ?? (err as Error | null)?.name ?? "";
   if (name === "NotAllowedError" || name === "SecurityError") {
@@ -54,6 +56,10 @@ function cameraErrorMessage(err: unknown): string {
   }
   const message = messageOf(err, "");
   if (message.includes("not supported")) return message;
+  const raw = message || (err instanceof Error ? err.message : String(err)) || "unknown error";
+  if (import.meta.env.DEV) {
+    return `I couldn't start the camera right now — ${name || "Error"}: ${raw}.`;
+  }
   return "I couldn't start the camera right now — try again or use typed questions.";
 }
 
@@ -66,7 +72,7 @@ export function useWaylo(): WayloController {
   const [errors, setErrors] = useState<WayloError[]>([]);
   const [demoMode, setDemoModeFlag] = useState(false);
   const [cameraOn, setCameraOn] = useState(false);
-  const [cameraAttempt, setCameraAttempt] = useState(0);
+  const [cameraStarting, setCameraStarting] = useState(false);
   const [micUsable, setMicUsable] = useState(true);
   const [engineReady, setEngineReady] = useState(false);
 
@@ -180,8 +186,51 @@ export function useWaylo(): WayloController {
     [addError, getTts]
   );
 
-  /** Warm the vision model, then move to the main screen.
-   * The camera itself starts in a mount effect once the <video> exists (see below). */
+  /** Wait (bounded frames) for the MainScreen <video> to commit, so the ref is valid.
+   * The video is always rendered on the main screen — never gated on cameraOn. */
+  const waitForVideoElement = useCallback(
+    (): Promise<HTMLVideoElement> =>
+      new Promise((resolve, reject) => {
+        let frames = 0;
+        const poll = () => {
+          const video = videoRef.current;
+          if (video) return resolve(video);
+          if (++frames >= 60) return reject(new Error("The camera preview didn't appear — please try again."));
+          requestAnimationFrame(poll);
+        };
+        poll();
+      }),
+    []
+  );
+
+  /** The real camera activation flow. Runs from the Start button and "Try camera again",
+   * AFTER the <video> element exists — so getUserMedia is always actually reached. */
+  const activateCamera = useCallback(async () => {
+    setCameraStarting(true);
+    try {
+      const video = await waitForVideoElement();
+      console.log("[WAYLO UI] camera activation");
+      console.log("[WAYLO UI] video element:", videoRef.current);
+      console.log("[WAYLO UI] starting camera");
+      await cameraService.start(video);
+      if (videoRef.current === video) setCameraOn(true);
+    } catch (err) {
+      setCameraOn(false);
+      addError("camera", cameraErrorMessage(err));
+    } finally {
+      setCameraStarting(false);
+    }
+  }, [addError, waitForVideoElement]);
+
+  /** Re-attempt camera acquisition (from the "Try camera again" button). */
+  const retryCamera = useCallback(() => {
+    setCameraOn(false);
+    void activateCamera();
+  }, [activateCamera]);
+
+  /** Warm the vision model, move to the main screen, then request the camera.
+   * The camera call is deliberately NOT in an effect: it runs here, from the
+   * activation flow, after setScreen("main") has mounted the <video>. */
   const start = useCallback(async () => {
     const engine = engineRef.current ?? (engineRef.current = createVisionEngine());
     try {
@@ -191,7 +240,8 @@ export function useWaylo(): WayloController {
       addError("vision", "The on-device vision model couldn't load. Check your connection and try again.");
     }
     setScreen("main");
-  }, [addError]);
+    await activateCamera();
+  }, [activateCamera, addError]);
 
   /** Voice input: Speechmatics → runQuery on the final transcript. */
   const listen = useCallback(async () => {
@@ -257,35 +307,6 @@ export function useWaylo(): WayloController {
     setDemoModeFlag(on);
   }, []);
 
-  /** Re-attempt camera acquisition (from the "Try camera again" button). */
-  const retryCamera = useCallback(() => {
-    setCameraAttempt((n) => n + 1);
-  }, []);
-
-  // Camera startup: runs once the MainScreen <video> is mounted (screen === "main").
-  // Previously this lived inside start(), where the video element didn't exist yet
-  // (MainScreen mounts after setScreen("main")) — so the camera was never requested.
-  useEffect(() => {
-    if (screen !== "main" || cameraOn) return;
-    const video = videoRef.current;
-    if (!video) return;
-    let cancelled = false;
-    (async () => {
-      if (cancelled) return;
-      try {
-        await cameraService.start(video);
-        if (!cancelled && videoRef.current === video) setCameraOn(true);
-      } catch (err) {
-        if (cancelled) return;
-        setCameraOn(false);
-        addError("camera", cameraErrorMessage(err));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [screen, cameraOn, cameraAttempt, addError]);
-
   // Live camera watchdog while on the main screen.
   useEffect(() => {
     if (screen !== "main") return;
@@ -346,7 +367,7 @@ export function useWaylo(): WayloController {
       modelLabel: engine?.modelLabel ?? "COCO-SSD · TensorFlow.js (on-device)",
       ready: engineReady,
     },
-    live: { cameraOn, micUsable },
+    live: { cameraOn, cameraStarting, micUsable },
     ttsAvailable: getTts().available,
     start,
     listen,

@@ -81,51 +81,57 @@ export function MainScreen({ c }: { c: WayloController }) {
       </div>
 
       <main className="max-w-3xl mx-auto mt-4 space-y-4">
-        {/* Camera stage */}
+        {/* Camera stage — the real <video> is ALWAYS mounted so videoRef stays valid
+            and cameraService.start(videoRef.current) can attach the live stream. */}
         <div className="panel overflow-hidden">
           <div className="relative aspect-[4/3] bg-black">
-            {c.live.cameraOn ? (
-              <>
-                <video
-                  ref={c.videoRef}
-                  aria-label="Live camera feed"
-                  className="absolute inset-0 h-full w-full object-cover -scale-x-100"
-                  autoPlay
-                  playsInline
-                  muted
-                />
-                {c.demoMode && <DebugOverlay scene={c.lastScene} videoWidth={videoSize.w} videoHeight={videoSize.h} />}
-                {/* state banner over video */}
-                <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/80 to-transparent px-4 py-3">
-                  <p className="text-sm text-white/90">
-                    {c.wayloState === "listening" && c.partial
-                      ? `“${c.partial}”`
-                      : "Your surroundings — frames stay on this device."}
-                  </p>
-                  {c.wayloState === "listening" && (
-                    <span className="flex items-center gap-1.5 text-primary text-sm font-semibold animate-listen">
-                      <Mic className="h-4 w-4" aria-hidden="true" />
-                      Listening
-                    </span>
-                  )}
-                </div>
-              </>
-            ) : (
-              <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 px-6 text-center">
+            <video
+              ref={c.videoRef}
+              aria-label="Live camera feed"
+              className="absolute inset-0 h-full w-full object-cover -scale-x-100"
+              autoPlay
+              playsInline
+              muted
+            />
+            {c.demoMode && <DebugOverlay scene={c.lastScene} videoWidth={videoSize.w} videoHeight={videoSize.h} />}
+            {/* state banner over video */}
+            <div className="absolute inset-x-0 bottom-0 flex items-center justify-between gap-2 bg-gradient-to-t from-black/80 to-transparent px-4 py-3">
+              <p className="text-sm text-white/90">
+                {c.wayloState === "listening" && c.partial
+                  ? `“${c.partial}”`
+                  : "Your surroundings — frames stay on this device."}
+              </p>
+              {c.wayloState === "listening" && (
+                <span className="flex items-center gap-1.5 text-primary text-sm font-semibold animate-listen">
+                  <Mic className="h-4 w-4" aria-hidden="true" />
+                  Listening
+                </span>
+              )}
+            </div>
+
+            {/* Honest status overlay — the preview below stays mounted, never hidden. */}
+            {!c.live.cameraOn && (
+              <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center">
                 <Camera className="h-10 w-10 text-muted" aria-hidden="true" />
-                <p className="text-muted text-lg">Camera isn't available right now.</p>
-                <p className="text-muted/80 text-sm max-w-sm">
-                  Check the browser permission, then retry. WAYLO still works with typed questions.
+                <p className="text-muted text-lg">
+                  {c.live.cameraStarting ? "Starting your camera…" : "Camera isn't available right now."}
                 </p>
-                <button
-                  type="button"
-                  onClick={() => c.retryCamera()}
-                  className="btn-ghost !py-2 !px-4 text-sm"
-                  aria-label="Try starting the camera again"
-                >
-                  <Camera className="h-4 w-4" aria-hidden="true" />
-                  Try camera again
-                </button>
+                <p className="text-muted/80 text-sm max-w-sm">
+                  {c.live.cameraStarting
+                    ? "Allow camera access when your browser asks — frames never leave this device."
+                    : "Check the browser permission, then retry. WAYLO still works with typed questions."}
+                </p>
+                {!c.live.cameraStarting && (
+                  <button
+                    type="button"
+                    onClick={() => c.retryCamera()}
+                    className="btn-ghost !py-2 !px-4 text-sm"
+                    aria-label="Try starting the camera again"
+                  >
+                    <Camera className="h-4 w-4" aria-hidden="true" />
+                    Try camera again
+                  </button>
+                )}
               </div>
             )}
           </div>
