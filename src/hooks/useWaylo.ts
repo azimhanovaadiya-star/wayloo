@@ -54,6 +54,9 @@ function cameraErrorMessage(err: unknown): string {
   if (name === "NotFoundError" || name === "OverconstrainedError") {
     return "No camera was found on this device — WAYLO still works with typed questions.";
   }
+  if (name === "AbortError") {
+    return "The camera preview was interrupted before it could start — try Start WAYLO or Try camera again.";
+  }
   const message = messageOf(err, "");
   if (message.includes("not supported")) return message;
   const raw = message || (err instanceof Error ? err.message : String(err)) || "unknown error";
@@ -79,6 +82,9 @@ export function useWaylo(): WayloController {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const engineRef = useRef<VisionEngine | null>(null);
   const busyRef = useRef(false);
+  /** Serializes camera activation so two getUserMedia attempts can never run
+   * concurrently (double-click on Start, rapid "Try again" taps). */
+  const cameraBusyRef = useRef(false);
   const ttsRef = useRef<TtsEngine | null>(null);
   const trackerRef = useRef(new PerformanceTracker());
 
@@ -203,9 +209,9 @@ export function useWaylo(): WayloController {
     []
   );
 
-  /** The real camera activation flow. Runs from the Start button and "Try camera again",
-   * AFTER the <video> element exists — so getUserMedia is always actually reached. */
-  const activateCamera = useCallback(async () => {
+  /** Unguarded camera setup — the caller holds the camera turn. Runs after the
+   * <video> element exists, so getUserMedia is always actually reached. */
+  const openCamera = useCallback(async () => {
     setCameraStarting(true);
     try {
       const video = await waitForVideoElement();
@@ -222,6 +228,23 @@ export function useWaylo(): WayloController {
     }
   }, [addError, waitForVideoElement]);
 
+  /** Public camera activation, guarded so overlapping triggers can never run
+   * two getUserMedia sequences concurrently — that interleaving made the later
+   * attempt re-assign srcObject and abort the earlier play() with
+   * "The play() request was interrupted by a new load request". */
+  const activateCamera = useCallback(async () => {
+    if (cameraBusyRef.current) {
+      console.log("[WAYLO UI] camera start already in progress — ignoring");
+      return;
+    }
+    cameraBusyRef.current = true;
+    try {
+      await openCamera();
+    } finally {
+      cameraBusyRef.current = false;
+    }
+  }, [openCamera]);
+
   /** Re-attempt camera acquisition (from the "Try camera again" button). */
   const retryCamera = useCallback(() => {
     setCameraOn(false);
@@ -230,18 +253,30 @@ export function useWaylo(): WayloController {
 
   /** Warm the vision model, move to the main screen, then request the camera.
    * The camera call is deliberately NOT in an effect: it runs here, from the
-   * activation flow, after setScreen("main") has mounted the <video>. */
+   * activation flow, after setScreen("main") has mounted the <video>.
+   * Guarded + button-disabled during the whole flow so a double-click cannot
+   * launch overlapping camera attempts. */
   const start = useCallback(async () => {
-    const engine = engineRef.current ?? (engineRef.current = createVisionEngine());
-    try {
-      await engine.load();
-      setEngineReady(true);
-    } catch {
-      addError("vision", "The on-device vision model couldn't load. Check your connection and try again.");
+    if (cameraBusyRef.current) {
+      console.log("[WAYLO UI] start already in progress — ignoring");
+      return;
     }
-    setScreen("main");
-    await activateCamera();
-  }, [activateCamera, addError]);
+    cameraBusyRef.current = true;
+    setCameraStarting(true); // immediate Start-button feedback during the model download
+    try {
+      const engine = engineRef.current ?? (engineRef.current = createVisionEngine());
+      try {
+        await engine.load();
+        setEngineReady(true);
+      } catch {
+        addError("vision", "The on-device vision model couldn't load. Check your connection and try again.");
+      }
+      setScreen("main");
+      await openCamera();
+    } finally {
+      cameraBusyRef.current = false;
+    }
+  }, [addError, openCamera]);
 
   /** Voice input: Speechmatics → runQuery on the final transcript. */
   const listen = useCallback(async () => {

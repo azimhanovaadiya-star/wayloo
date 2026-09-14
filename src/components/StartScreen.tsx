@@ -5,7 +5,15 @@
 import { Lock, Mic, Sparkles, Volume2 } from "lucide-react";
 import { WayloLogo } from "./WayloLogo";
 
-export function StartScreen({ onStart }: { onStart: () => Promise<void> }) {
+export function StartScreen({
+  onStart,
+  starting,
+}: {
+  onStart: () => Promise<void>;
+  /** True while the model is warming up + the camera prompt is pending — keeps
+   * the Start button from spawning overlapping camera attempts. */
+  starting: boolean;
+}) {
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-6 py-12 bg-background">
       <main className="w-full max-w-2xl flex flex-col items-center text-center">
@@ -54,11 +62,13 @@ export function StartScreen({ onStart }: { onStart: () => Promise<void> }) {
         <button
           type="button"
           onClick={() => void onStart()}
-          className="btn-primary mt-10 text-xl"
+          disabled={starting}
+          aria-busy={starting}
+          className="btn-primary mt-10 text-xl disabled:opacity-60 disabled:pointer-events-none"
           aria-label="Start WAYLO — enables camera and microphone"
         >
           <Mic className="h-6 w-6" aria-hidden="true" />
-          Start WAYLO
+          {starting ? "Starting WAYLO…" : "Start WAYLO"}
         </button>
 
         <p className="mt-4 flex items-center gap-2 text-sm text-muted">

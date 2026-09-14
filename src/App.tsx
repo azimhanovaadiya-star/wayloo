@@ -11,7 +11,7 @@ export default function App() {
   const waylo = useWaylo();
 
   if (waylo.screen === "start") {
-    return <StartScreen onStart={waylo.start} />;
+    return <StartScreen onStart={waylo.start} starting={waylo.live.cameraStarting} />;
   }
   return <MainScreen c={waylo} />;
 }
