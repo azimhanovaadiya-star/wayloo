@@ -24,7 +24,7 @@ import { sessionContext } from "../services/context/SessionContext";
 import { PerformanceTracker } from "../services/metrics/PerformanceTracker";
 import { DEMO_ANALYSIS_FPS } from "../constants";
 
-export type MicStatus = "unknown" | "requesting" | "granted" | "denied";
+export type MicStatus = "unknown" | "requesting" | "granted" | "denied" | "unavailable";
 export type VisionState = "loading" | "ready" | "failed";
 
 export interface WayloController {
@@ -102,6 +102,12 @@ function micDeniedMessage(err: unknown): string {
   }
 }
 
+/** Map a mic-access error name to an honest mic status: denied — the user said
+ *  no; anything else (no device, in use, unsupported) — unavailable for now. */
+function micStatusFromName(name: string): MicStatus {
+  return name === "NotAllowedError" || name === "SecurityError" ? "denied" : "unavailable";
+}
+
 export function useWaylo(): WayloController {
   const [screen, setScreen] = useState<"start" | "main">("start");
   const [wayloState, setWayloState] = useState<WayloState>("idle");
@@ -160,7 +166,7 @@ export function useWaylo(): WayloController {
     micStatusRef.current = next;
     setMicStatusState(next);
     if (next === "granted") setMicUsable(true);
-    if (next === "denied") setMicUsable(false);
+    if (next === "denied" || next === "unavailable") setMicUsable(false);
   }, []);
 
   /** The full SEE → HEAR → UNDERSTAND → RESPOND leg for one query. */
@@ -171,6 +177,7 @@ export function useWaylo(): WayloController {
       busyRef.current = true;
       setPartial(query);
       setWayloState("analyzing");
+      console.log(`[WAYLO] Processing: "${query}"`);
       try {
         const video = videoRef.current;
         const engine = engineRef.current ?? (engineRef.current = createVisionEngine());
@@ -221,6 +228,7 @@ export function useWaylo(): WayloController {
         };
         sessionContext.rememberTurn(turn);
         setLastTurn(turn);
+        console.log(`[WAYLO] Response: "${response.text}"`);
 
         setWayloState("responding");
         const speakStart = performance.now();
@@ -365,7 +373,9 @@ export function useWaylo(): WayloController {
       applyMicStatus("granted");
       return true;
     } catch (err) {
-      applyMicStatus("denied");
+      // A denied prompt and a missing/broken device are different failures with
+      // different recovery steps — classify by the error NAME, never by text.
+      applyMicStatus(micStatusFromName((err as Error | null)?.name ?? ""));
       addError("microphone", micDeniedMessage(err), { speak: false });
       return false;
     }
@@ -393,26 +403,45 @@ export function useWaylo(): WayloController {
         onEvent: (e) => {
           if (e.type === "partial" && e.text) setPartial(e.text);
           if (e.type === "error") {
-            setMicUsable(false);
-            addError("stt", e.message);
+            // Classify by the error NAME carried on the event: a permission
+            // problem is a microphone failure; a recognition problem is NOT.
+            const name = e.name ?? "";
+            if (name === "NotAllowedError" || name === "SecurityError") {
+              applyMicStatus("denied");
+              addError("microphone", micDeniedMessage(e), { speak: false });
+            } else if (name === "NotFoundError" || name === "NotReadableError") {
+              applyMicStatus("unavailable");
+              addError("microphone", e.message, { speak: false });
+            } else {
+              addError("stt", e.message);
+            }
           }
         },
         onFinal: (text) => {
+          console.log(`[WAYLO] Transcript: "${text}"`);
           const tokenMs = trackerRef.current.ms("token");
           const sttMs = trackerRef.current.ms("stt");
           void runQuery(text, { tokenMs, sttMs });
         },
       });
     } catch (err) {
-      const message = messageOf(
-        err,
-        "Voice recognition is temporarily unavailable. You can type your question below."
-      );
-      if (/microphone|blocked|permission|denied/i.test(message)) {
+      const name = (err as Error | null)?.name ?? "";
+      if (name === "NotAllowedError" || name === "SecurityError") {
         applyMicStatus("denied");
         addError("microphone", micDeniedMessage(err), { speak: false });
+      } else if (
+        name === "NotFoundError" ||
+        name === "NotReadableError" ||
+        name === "NotSupportedError" ||
+        name === "OverconstrainedError"
+      ) {
+        applyMicStatus("unavailable");
+        addError("microphone", micDeniedMessage(err), { speak: false });
       } else {
-        addError("stt", message);
+        addError(
+          "stt",
+          messageOf(err, "Voice recognition is temporarily unavailable. You can type your question below.")
+        );
       }
       setWayloState("idle");
     }

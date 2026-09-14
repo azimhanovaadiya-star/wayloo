@@ -186,7 +186,9 @@ export function MainScreen({ c }: { c: WayloController }) {
         </div>
 
         {/* Mic permission explainer / recovery — shown until granted */}
-        {(c.micPrompt || c.micStatus === "denied") && <MicPermissionCard c={c} />}
+        {(c.micPrompt || c.micStatus === "denied" || c.micStatus === "unavailable") && (
+          <MicPermissionCard c={c} />
+        )}
 
         {/* Voice + typed input */}
         <div className="space-y-3">
@@ -268,31 +270,42 @@ export function MainScreen({ c }: { c: WayloController }) {
 }
 
 /** Pre-permission explainer ("WAYLO needs your microphone to hear your
- * questions") or, once denied, exact recovery steps — never a dead-end error. */
+ * questions") or, once denied/unavailable, exact recovery steps — never a
+ * dead-end error. */
 function MicPermissionCard({ c }: { c: WayloController }) {
   const denied = c.micStatus === "denied";
+  const unavailable = c.micStatus === "unavailable";
+  const blocked = denied || unavailable;
   return (
     <div
       className="panel p-4 border-primary/40"
-      role={denied ? "alert" : "region"}
-      aria-live={denied ? "assertive" : "polite"}
+      role={blocked ? "alert" : "region"}
+      aria-live={blocked ? "assertive" : "polite"}
     >
       <div className="flex items-start gap-3">
         <div className="mt-0.5">
           {denied ? (
             <ShieldAlert className="h-5 w-5 text-destructive" aria-hidden="true" />
+          ) : unavailable ? (
+            <MicOff className="h-5 w-5 text-muted" aria-hidden="true" />
           ) : (
             <Mic className="h-5 w-5 text-primary" aria-hidden="true" />
           )}
         </div>
         <div className="flex-1">
           <h3 className="font-heading font-semibold text-foreground text-lg">
-            {denied ? "Microphone is blocked" : "WAYLO needs your microphone to hear your questions"}
+            {denied
+              ? "Microphone is blocked"
+              : unavailable
+                ? "No microphone available"
+                : "WAYLO needs your microphone to hear your questions"}
           </h3>
           <p className="mt-1 text-sm text-muted leading-relaxed">
             {denied
               ? "Turn it on in your browser: tap the lock or “Site settings” icon next to the address bar → Microphone → Allow — then come back and try again. On a phone, also check Settings → Privacy → Microphone."
-              : "Nothing is recorded or stored — audio is transcribed live and never leaves this device. You can always type instead."}
+              : unavailable
+                ? "WAYLO couldn't start a microphone on this device. Plug one in or make sure it isn't in use by another app, then try again — or just type your question below."
+                : "Nothing is recorded or stored — audio is transcribed live and never leaves this device. You can always type instead."}
           </p>
           <div className="mt-3 flex flex-wrap gap-2">
             <button
@@ -308,12 +321,12 @@ function MicPermissionCard({ c }: { c: WayloController }) {
                 </>
               ) : (
                 <>
-                  {denied ? <MicOff className="h-4 w-4" aria-hidden="true" /> : <Mic className="h-4 w-4" aria-hidden="true" />}
-                  {denied ? "Try microphone again" : "Allow microphone"}
+                  <MicOff className="h-4 w-4" aria-hidden="true" />
+                  {denied ? "Try microphone again" : unavailable ? "Try again" : "Allow microphone"}
                 </>
               )}
             </button>
-            {!denied && (
+            {!blocked && (
               <button type="button" onClick={c.dismissMicPrompt} className="btn-ghost !py-2 !px-5 text-sm">
                 Not now
               </button>
