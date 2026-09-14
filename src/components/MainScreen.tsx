@@ -1,10 +1,17 @@
 /**
  * MainScreen — the running loop: camera preview, status, voice + typed input,
  * WAYLO's answer panel, and the honest demo/metrics view (demo mode only).
+ *
+ * Permission UX:
+ *  - Tapping "Ask by voice" with no mic permission shows an explainer card
+ *    ("WAYLO needs your microphone…") whose Allow button triggers the real
+ *    getUserMedia prompt. Denials turn the card into exact recovery steps.
+ *  - Question-asking (voice, typed, quick buttons) is disabled until the
+ *    on-device vision model reports ready.
  */
 
 import { useState } from "react";
-import { Camera, Cpu, Gauge, LogOut, Mic, Square } from "lucide-react";
+import { Camera, Cpu, Gauge, Loader2, LogOut, Mic, MicOff, ShieldAlert, Square } from "lucide-react";
 import type { WayloController } from "../hooks/useWaylo";
 import type { Intent, LatencyMetrics } from "../types";
 import { WayloLogo } from "./WayloLogo";
@@ -41,6 +48,7 @@ export function MainScreen({ c }: { c: WayloController }) {
   const videoSize = { w: video?.videoWidth ?? 0, h: video?.videoHeight ?? 0 };
   const status = STATUS[c.wayloState];
   const busy = c.wayloState === "analyzing" || c.wayloState === "responding";
+  const visionReady = c.vision.ready;
 
   return (
     <div className="min-h-screen bg-background px-4 py-4 md:px-8">
@@ -77,6 +85,12 @@ export function MainScreen({ c }: { c: WayloController }) {
             <span className="h-3 w-3 rounded-full bg-muted/60" aria-hidden="true" />
           )}
           <span className={`font-heading font-semibold text-lg ${status.hint}`}>{status.label}</span>
+          {!visionReady && (
+            <span className="ml-auto inline-flex items-center gap-1.5 text-sm text-muted">
+              <Loader2 className="spinner h-4 w-4 text-primary" aria-hidden="true" />
+              Vision model loading…
+            </span>
+          )}
         </div>
       </div>
 
@@ -171,13 +185,16 @@ export function MainScreen({ c }: { c: WayloController }) {
           </section>
         </div>
 
+        {/* Mic permission explainer / recovery — shown until granted */}
+        {(c.micPrompt || c.micStatus === "denied") && <MicPermissionCard c={c} />}
+
         {/* Voice + typed input */}
         <div className="space-y-3">
           <div className="flex flex-wrap gap-2" role="group" aria-label="Ask WAYLO">
             <button
               type="button"
               onClick={() => void (c.wayloState === "listening" ? c.stopListening() : c.listen())}
-              disabled={busy}
+              disabled={busy || !visionReady}
               className={c.wayloState === "listening" ? "btn-ghost" : "btn-primary"}
               aria-label={c.wayloState === "listening" ? "Stop listening" : "Ask a question by voice"}
             >
@@ -193,7 +210,7 @@ export function MainScreen({ c }: { c: WayloController }) {
               className="flex-1 flex gap-2 min-w-0"
               onSubmit={(e) => {
                 e.preventDefault();
-                if (typed.trim()) {
+                if (typed.trim() && visionReady) {
                   void c.ask(typed);
                   setTyped("");
                 }
@@ -207,10 +224,22 @@ export function MainScreen({ c }: { c: WayloController }) {
                 type="text"
                 value={typed}
                 onChange={(e) => setTyped(e.target.value)}
-                placeholder={c.live.micUsable ? "…or type a question" : "Type your question (microphone is off)"}
-                className="flex-1 min-w-0 panel !bg-surface-2 px-4 text-lg text-foreground placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-primary"
+                disabled={!visionReady}
+                placeholder={
+                  !visionReady
+                    ? "Loading the vision model…"
+                    : c.live.micUsable
+                      ? "…or type a question"
+                      : "Type your question (microphone is off)"
+                }
+                className="flex-1 min-w-0 panel !bg-surface-2 px-4 text-lg text-foreground placeholder:text-muted focus:outline-none focus:ring-2 focus:ring-primary disabled:opacity-50"
               />
-              <button type="submit" className="btn-ghost shrink-0" aria-label="Ask typed question">
+              <button
+                type="submit"
+                className="btn-ghost shrink-0 disabled:opacity-50"
+                disabled={!visionReady}
+                aria-label="Ask typed question"
+              >
                 Ask
               </button>
             </form>
@@ -219,7 +248,13 @@ export function MainScreen({ c }: { c: WayloController }) {
           {/* Quick questions (also voice-loop friendly for demos) */}
           <div className="flex flex-wrap gap-2" role="group" aria-label="Example questions">
             {QUICK_QUESTIONS.map((q) => (
-              <button key={q} type="button" onClick={() => void c.ask(q)} className="chip" disabled={busy}>
+              <button
+                key={q}
+                type="button"
+                onClick={() => void c.ask(q)}
+                className="chip disabled:opacity-50 disabled:pointer-events-none"
+                disabled={!visionReady || busy}
+              >
                 {q}
               </button>
             ))}
@@ -228,6 +263,64 @@ export function MainScreen({ c }: { c: WayloController }) {
 
         {c.demoMode && <DemoPanel c={c} />}
       </main>
+    </div>
+  );
+}
+
+/** Pre-permission explainer ("WAYLO needs your microphone to hear your
+ * questions") or, once denied, exact recovery steps — never a dead-end error. */
+function MicPermissionCard({ c }: { c: WayloController }) {
+  const denied = c.micStatus === "denied";
+  return (
+    <div
+      className="panel p-4 border-primary/40"
+      role={denied ? "alert" : "region"}
+      aria-live={denied ? "assertive" : "polite"}
+    >
+      <div className="flex items-start gap-3">
+        <div className="mt-0.5">
+          {denied ? (
+            <ShieldAlert className="h-5 w-5 text-destructive" aria-hidden="true" />
+          ) : (
+            <Mic className="h-5 w-5 text-primary" aria-hidden="true" />
+          )}
+        </div>
+        <div className="flex-1">
+          <h3 className="font-heading font-semibold text-foreground text-lg">
+            {denied ? "Microphone is blocked" : "WAYLO needs your microphone to hear your questions"}
+          </h3>
+          <p className="mt-1 text-sm text-muted leading-relaxed">
+            {denied
+              ? "Turn it on in your browser: tap the lock or “Site settings” icon next to the address bar → Microphone → Allow — then come back and try again. On a phone, also check Settings → Privacy → Microphone."
+              : "Nothing is recorded or stored — audio is transcribed live and never leaves this device. You can always type instead."}
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => void c.allowMic()}
+              disabled={c.micStatus === "requesting"}
+              className="btn-primary !py-2 !px-5 text-sm disabled:opacity-60"
+            >
+              {c.micStatus === "requesting" ? (
+                <>
+                  <Loader2 className="spinner h-4 w-4" aria-hidden="true" />
+                  Requesting…
+                </>
+              ) : (
+                <>
+                  {denied ? <MicOff className="h-4 w-4" aria-hidden="true" /> : <Mic className="h-4 w-4" aria-hidden="true" />}
+                  {denied ? "Try microphone again" : "Allow microphone"}
+                </>
+              )}
+            </button>
+            {!denied && (
+              <button type="button" onClick={c.dismissMicPrompt} className="btn-ghost !py-2 !px-5 text-sm">
+                Not now
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
     </div>
   );
 }

@@ -86,7 +86,9 @@ function makeResampler(srcRate: number): (input: Float32Array) => Int16Array {
 async function getMicStream(): Promise<MediaStream> {
   if (!navigator.mediaDevices?.getUserMedia) {
     devLog("mic permission DENIED — getUserMedia unsupported");
-    throw new Error("Microphone access is not supported in this browser.");
+    const e = new Error("Microphone access is not supported in this browser.");
+    e.name = "NotSupportedError";
+    throw e;
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
@@ -95,10 +97,11 @@ async function getMicStream(): Promise<MediaStream> {
     devLog("mic permission GRANTED", `audio tracks: ${stream.getAudioTracks().length}`);
     return stream;
   } catch (err) {
-    const detail =
-      err instanceof DOMException ? err.name : err instanceof Error ? err.message : String(err);
-    devLog("mic permission DENIED", detail);
-    throw new Error("Microphone access was denied. Allow microphone access and try again.");
+    const name = err instanceof DOMException ? err.name : err instanceof Error ? err.name : "UnknownError";
+    devLog("mic permission DENIED", name);
+    const e = new Error("Microphone access was denied. Allow microphone access and try again.");
+    e.name = name; // preserved so the UI can show precise recovery steps
+    throw e;
   }
 }
 
@@ -160,9 +163,48 @@ function errorDetail(msg: Record<string, unknown>): string {
 
 export class SpeechService {
   private session: ActiveSession | null = null;
+  /** Mic stream acquired via requestPermission() and reused across STT sessions
+   *  so the browser permission prompt appears exactly once per app session. */
+  private heldStream: MediaStream | null = null;
 
   get active(): boolean {
     return this.session !== null && !this.session.tornDown;
+  }
+
+  /** True while a live mic stream is held (permission already granted). */
+  get micPermissionHeld(): boolean {
+    return (
+      this.heldStream !== null && this.heldStream.getAudioTracks().some((t) => t.readyState === "live")
+    );
+  }
+
+  /** Explicitly acquire microphone permission BEFORE any speech-to-text call.
+   *  Must run from a user gesture so the browser shows its permission dialog;
+   *  the UI explains why WAYLO needs the mic before invoking this. The held
+   *  stream is reused by start(), so no second dialog appears later. */
+  async requestPermission(): Promise<void> {
+    if (this.micPermissionHeld) return;
+    try {
+      this.heldStream = await getMicStream();
+    } catch (err) {
+      if (err instanceof Error && err.name === "OverconstrainedError") {
+        // A few devices reject specific audio constraints — fall back to defaults.
+        try {
+          this.heldStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          return;
+        } catch {
+          /* fall through to re-throw the original error */
+        }
+      }
+      throw err;
+    }
+  }
+
+  /** Stop and drop the held mic stream (app session ending). */
+  releasePermission(): void {
+    if (!this.heldStream) return;
+    this.heldStream.getTracks().forEach((t) => t.stop());
+    this.heldStream = null;
   }
 
   async start(opts: {
@@ -270,7 +312,9 @@ export class SpeechService {
 
     let stream: MediaStream;
     try {
-      stream = await getMicStream();
+      // Reuse the held permission stream when present (granted via
+      // requestPermission) — never prompt twice in one app session.
+      stream = this.heldStream ?? (this.heldStream = await getMicStream());
     } catch (err) {
       try {
         ws.close();
@@ -360,9 +404,12 @@ export class SpeechService {
     if (this.session === session) this.session = null;
     session.timers.forEach(clearTimeout);
 
-    // 1) Stop the microphone tracks.
-    devLog("Stopping microphone tracks");
-    session.stream.getTracks().forEach((t) => t.stop());
+    // 1) Stop the microphone tracks — unless they belong to the held permission
+    //    stream, which stays live for the rest of the app session.
+    if (session.stream !== this.heldStream) {
+      devLog("Stopping microphone tracks");
+      session.stream.getTracks().forEach((t) => t.stop());
+    }
 
     // 2) Disconnect the Web Audio graph: source then processor.
     try {

@@ -37,4 +37,14 @@ export default defineConfig(() => ({
     allowedHosts: true as const,
     hmr: false,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Keep TensorFlow.js out of the app chunk so the main bundle stays small.
+        manualChunks: {
+          tf: ["@tensorflow/tfjs", "@tensorflow-models/coco-ssd"],
+        },
+      },
+    },
+  },
 }))

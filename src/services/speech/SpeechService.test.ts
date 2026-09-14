@@ -4,8 +4,8 @@
  * (word-level `results[].alternatives[].content` and aggregated
  * `metadata.transcript`) — nothing here is mocked or fabricated.
  */
-import { describe, expect, it } from "vitest";
-import { transcriptOf } from "./SpeechService";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { SpeechService, transcriptOf } from "./SpeechService";
 
 describe("transcriptOf (Speechmatics v2 wire format)", () => {
   it("extracts a partial transcript from word-level results", () => {
@@ -80,5 +80,57 @@ describe("transcriptOf (Speechmatics v2 wire format)", () => {
     expect(transcriptOf({ message: "AddPartialTranscript", results: "nope" })).toBe("");
     expect(transcriptOf({ message: "AddTranscript", metadata: null })).toBe("");
     expect(transcriptOf({})).toBe("");
+  });
+});
+
+describe("microphone permission (explicit pre-STT request)", () => {
+  function fakeStream() {
+    const tracks = [{ readyState: "live", stop: vi.fn() }, { readyState: "live", stop: vi.fn() }];
+    return {
+      tracks,
+      getAudioTracks: () => tracks.filter((t) => t.readyState === "live"),
+      getTracks: () => tracks,
+    };
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    svc.releasePermission();
+  });
+
+  const svc = new SpeechService();
+
+  it("calls getUserMedia({ audio }) exactly once and holds the granted stream", async () => {
+    const getUserMedia = vi.fn().mockResolvedValue(fakeStream());
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia } });
+
+    await svc.requestPermission();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+    expect(getUserMedia.mock.calls[0][0]).toEqual({ audio: expect.anything() });
+    expect(svc.micPermissionHeld).toBe(true);
+
+    // Second request reuses the held stream — no second browser dialog.
+    await svc.requestPermission();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+  });
+
+  it("releasePermission stops the held tracks", async () => {
+    const stream = fakeStream();
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn().mockResolvedValue(stream) } });
+
+    await svc.requestPermission();
+    expect(svc.micPermissionHeld).toBe(true);
+
+    svc.releasePermission();
+    expect(stream.tracks.every((t) => t.stop.mock.calls.length === 1)).toBe(true);
+    expect(svc.micPermissionHeld).toBe(false);
+  });
+
+  it("rejects with the DOMException name preserved so the UI can show recovery steps", async () => {
+    const denied = Object.assign(new Error("denied"), { name: "NotAllowedError" });
+    vi.stubGlobal("navigator", { mediaDevices: { getUserMedia: vi.fn().mockRejectedValue(denied) } });
+
+    await expect(svc.requestPermission()).rejects.toMatchObject({ name: "NotAllowedError" });
+    expect(svc.micPermissionHeld).toBe(false);
   });
 });

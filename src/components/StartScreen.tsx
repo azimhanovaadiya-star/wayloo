@@ -1,18 +1,26 @@
 /**
  * Landing / splash. Hero → how it works → CTA, black + amber, big targets.
+ * Shows a visible loading state while the on-device vision model initializes,
+ * and a Retry affordance if that one-time download fails.
  */
 
-import { Lock, Mic, Sparkles, Volume2 } from "lucide-react";
+import { Lock, Mic, RefreshCw, Sparkles, Volume2 } from "lucide-react";
 import { WayloLogo } from "./WayloLogo";
+import type { VisionState } from "../hooks/useWaylo";
 
 export function StartScreen({
   onStart,
   starting,
+  visionState,
+  onRetryVision,
 }: {
   onStart: () => Promise<void>;
   /** True while the model is warming up + the camera prompt is pending — keeps
    * the Start button from spawning overlapping camera attempts. */
   starting: boolean;
+  /** "loading" while the vision model downloads, "failed" if it couldn't. */
+  visionState: VisionState;
+  onRetryVision: () => Promise<void>;
 }) {
   return (
     <div className="min-h-screen flex flex-col items-center justify-center px-6 py-12 bg-background">
@@ -59,21 +67,55 @@ export function StartScreen({
           </div>
         </section>
 
-        <button
-          type="button"
-          onClick={() => void onStart()}
-          disabled={starting}
-          aria-busy={starting}
-          className="btn-primary mt-10 text-xl disabled:opacity-60 disabled:pointer-events-none"
-          aria-label="Start WAYLO — enables camera and microphone"
-        >
-          <Mic className="h-6 w-6" aria-hidden="true" />
-          {starting ? "Starting WAYLO…" : "Start WAYLO"}
-        </button>
+        {visionState === "failed" ? (
+          <div className="mt-10 flex flex-col items-center gap-4">
+            <p className="max-w-md text-muted text-base leading-relaxed">
+              WAYLO's on-device vision model didn't load. It's a one-time download
+              (about 6 MB) — after that it works offline. Check your connection and
+              try again.
+            </p>
+            <button
+              type="button"
+              onClick={() => void onRetryVision()}
+              className="btn-primary text-xl"
+              aria-label="Try loading the vision model again"
+            >
+              <RefreshCw className="h-6 w-6" aria-hidden="true" />
+              Try loading vision again
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={() => void onStart()}
+            disabled={starting}
+            aria-busy={starting}
+            className="btn-primary mt-10 text-xl disabled:opacity-60 disabled:pointer-events-none"
+            aria-label="Start WAYLO — loads the vision model, then enables camera and microphone"
+          >
+            {starting ? (
+              <>
+                <span className="spinner h-6 w-6 border-2 border-on-primary/40 border-t-on-primary rounded-full" aria-hidden="true" />
+                Loading WAYLO's vision model…
+              </>
+            ) : (
+              <>
+                <Mic className="h-6 w-6" aria-hidden="true" />
+                Start WAYLO
+              </>
+            )}
+          </button>
+        )}
 
         <p className="mt-4 flex items-center gap-2 text-sm text-muted">
-          <Lock className="h-4 w-4 text-primary" aria-hidden="true" />
-          Frames &amp; audio stay on this device. You'll be asked for camera and microphone access.
+          {starting ? (
+            <span className="spinner h-4 w-4 border-2 border-primary/40 border-t-primary rounded-full" aria-hidden="true" />
+          ) : (
+            <Lock className="h-4 w-4 text-primary" aria-hidden="true" />
+          )}
+          {starting
+            ? "Downloading the on-device vision model — one time, then it works offline."
+            : "Frames & audio stay on this device. You'll be asked for camera and microphone access."}
         </p>
 
         <p className="mt-6 text-sm text-muted/80">

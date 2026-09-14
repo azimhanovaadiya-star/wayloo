@@ -124,6 +124,14 @@ body {
   border-radius: 0.875rem;
 }
 
+/* Loading spinner (e.g. while the on-device vision model initializes) */
+@keyframes waylo-spin {
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  animation: waylo-spin 0.9s linear infinite;
+}
+
 .amber-glow-text {
   text-shadow: 0 0 24px rgba(245, 183, 0, 0.55);
 }
