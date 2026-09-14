@@ -1,22 +1,33 @@
 /**
- * SpeechService — the only module that knows anything about Speechmatics.
+ * SpeechService — the only module that knows about speech providers.
  * Everything else in the app calls `start({ onEvent, onFinal })` and receives
  * typed SpeechEvents (PRD §1 abstraction rule).
  *
- * Flow: fetch a fresh JWT from the Supabase Edge Function (the secret never
- * touches client code) → open the WebSocket → wait for `RecognitionStarted` →
- * stream 16 kHz mono PCM from the mic.
+ * Engines (in priority order):
+ *  1. Speechmatics RT v2 (primary) — fresh JWT from the Supabase Edge Function
+ *     (the secret never touches client code) → WebSocket → 16 kHz mono PCM.
+ *  2. Browser-native Web Speech API (fallback) — used ONLY when the Speechmatics
+ *     path fails before any speech was heard (token fetch, WebSocket connect,
+ *     early server error) and the browser exposes SpeechRecognition.
  *
- * Audio graph — the path that actually carries sound to Speechmatics:
+ * Mic-permission state and speech-recognition state are kept strictly apart:
+ *  - a speech-recognition error is NEVER reported as "Microphone access denied";
+ *  - permission-denied / permission-granted / microphone-unavailable /
+ *    listening / processing / error are distinct, honest states.
+ *
+ * Audio graph (Speechmatics) — the path that carries sound:
  *   microphone → MediaStreamAudioSourceNode → ScriptProcessorNode (onaudioprocess
  *   resamples each chunk to 16 kHz pcm_s16le and sends it over the WebSocket)
  *   → muted GainNode → AudioContext destination (muted so the user is not
  *   echo-monitored). The source MUST be connected to the processor, otherwise
  *   onaudioprocess never receives any microphone samples.
  *
- * Contains temporary development-only logging (console.debug, active only when
- * import.meta.env.DEV is true — stripped from production builds). It never
- * logs the JWT, the WebSocket URL (which embeds the JWT), or any secret.
+ * Diagnostics — pipeline markers are written to the console with a stable
+ * [WAYLO Speech] prefix so the live flow is inspectable:
+ *   MIC_PERMISSION_GRANTED, MIC_STREAM_STARTED, AUDIO_CAPTURE_STARTED,
+ *   WEBSOCKET_CONNECTED, AUDIO_CHUNK_SENT (dev builds only — too chatty for
+ *   prod), TRANSCRIPTION_RECEIVED, TRANSCRIPT_TEXT.
+ * No secrets, JWTs, or WebSocket URLs (which embed the JWT) are ever logged.
  */
 
 import { createClient, SupabaseClient } from "@supabase/supabase-js";
@@ -25,11 +36,79 @@ import { STT_IDLE_TIMEOUT_MS, STT_LANGUAGE, STT_MAX_UTTERANCE_MS } from "../../c
 
 const WS_ENDPOINT = "wss://eu.rt.speechmatics.com/v2";
 const TARGET_RATE = 16000;
+const WS_CONNECT_TIMEOUT_MS = 10_000;
+const START_TIMEOUT_MS = 10_000;
+const BROWSER_START_TIMEOUT_MS = 8_000;
+const FINAL_FLUSH_MS = 350;
 
-/** Dev-only diagnostics. Never logs URLs, tokens, or secrets. */
-function devLog(...parts: unknown[]): void {
-  if (import.meta.env.DEV) console.debug("[WAYLO Speech]", ...parts);
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Always-visible pipeline diagnostics. Never logs tokens, URLs, or secrets. */
+function log(...parts: unknown[]): void {
+  console.log("[WAYLO Speech]", ...parts);
 }
+function warnLog(...parts: unknown[]): void {
+  console.warn("[WAYLO Speech]", ...parts);
+}
+
+/* ------------------------------------------------------------------ */
+/* Error model — mic-permission and recognition failures stay distinct */
+/* ------------------------------------------------------------------ */
+
+export type SpeechErrorKind = "permission" | "unavailable" | "network" | "stt";
+
+export class SpeechError extends Error {
+  readonly kind: SpeechErrorKind;
+  constructor(kind: SpeechErrorKind, message: string, name = kind) {
+    super(message);
+    this.name = name; // preserved so the UI can show exact recovery steps
+    this.kind = kind;
+  }
+}
+
+function asSpeechError(err: unknown, fallbackKind: SpeechErrorKind = "stt"): SpeechError {
+  if (err instanceof SpeechError) return err;
+  const name = err instanceof Error ? err.name : "UnknownError";
+  const message = err instanceof Error ? err.message : String(err);
+  return new SpeechError(fallbackKind, message, name);
+}
+
+/** Classify a getUserMedia failure name into an honest, UI-actionable kind. */
+export function micFailureKind(name: string): SpeechErrorKind {
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return "permission";
+    case "NotFoundError":
+    case "NotReadableError":
+    case "NotSupportedError":
+    case "OverconstrainedError":
+      return "unavailable";
+    default:
+      return "stt";
+  }
+}
+
+/** Human message per getUserMedia failure name. */
+function micFailureMessage(name: string): string {
+  switch (name) {
+    case "NotAllowedError":
+    case "SecurityError":
+      return "Microphone access was denied. Allow microphone access in the browser and try again.";
+    case "NotFoundError":
+      return "No microphone was found on this device. Plug one in or check your device settings, then try again.";
+    case "NotReadableError":
+      return "Your microphone is being used by another app. Close that app and try again.";
+    case "NotSupportedError":
+      return "This browser doesn't support microphone input. Try a current version of Chrome, Edge, or Safari.";
+    default:
+      return "Microphone access failed. Check your browser's site permissions for this page, then try again.";
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Supabase / token                                                    */
+/* ------------------------------------------------------------------ */
 
 let supabase: SupabaseClient | null = null;
 
@@ -38,8 +117,10 @@ function getSupabase(): SupabaseClient {
   const url = import.meta.env.VITE_SUPABASE_URL as string | undefined;
   const anonKey = import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined;
   if (!url || !anonKey) {
-    throw new Error(
-      "WAYLO is missing its Supabase configuration. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in the project's Environment settings."
+    throw new SpeechError(
+      "stt",
+      "WAYLO is missing its Supabase configuration. Add VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY in the project's Environment settings.",
+      "ConfigurationError"
     );
   }
   supabase = createClient(url, anonKey);
@@ -47,21 +128,43 @@ function getSupabase(): SupabaseClient {
 }
 
 /** Mint a fresh short-lived Speechmatics RT JWT via the Edge Function. */
-export async function fetchToken(): Promise<{ token: string; ms: number }> {
+async function fetchToken(): Promise<{ token: string; ms: number }> {
   const t0 = performance.now();
-  const { data, error } = await getSupabase().functions.invoke<{ token?: string }>(
-    "speechmatics-token",
-    { body: {} }
-  );
+  let client: SupabaseClient;
+  try {
+    client = getSupabase();
+  } catch (err) {
+    throw asSpeechError(err);
+  }
+  const { data, error } = await client.functions.invoke<{ token?: string }>("speechmatics-token", {
+    body: {},
+  });
   const ms = Math.round(performance.now() - t0);
   if (error) {
-    throw new Error("Speech recognition is temporarily unavailable. Please try again in a moment.");
+    warnLog(
+      "Token fetch failed (status",
+      (error as { context?: { status?: number } }).context?.status ?? "n/a",
+      ")"
+    );
+    throw new SpeechError(
+      "stt",
+      "Speech recognition is temporarily unavailable. Please try again in a moment.",
+      "TokenError"
+    );
   }
   if (!data?.token) {
-    throw new Error("Speech recognition is temporarily unavailable — the token service returned no key.");
+    throw new SpeechError(
+      "stt",
+      "Speech recognition is temporarily unavailable — the token service returned no key.",
+      "TokenError"
+    );
   }
   return { token: data.token, ms };
 }
+
+/* ------------------------------------------------------------------ */
+/* Shared audio helpers                                                */
+/* ------------------------------------------------------------------ */
 
 /** Linear-interpolation resampler: sourceRate → 16 kHz, output Int16 PCM. */
 function makeResampler(srcRate: number): (input: Float32Array) => Int16Array {
@@ -83,41 +186,120 @@ function makeResampler(srcRate: number): (input: Float32Array) => Int16Array {
   };
 }
 
+/** Verify a live mic stream is actually usable before streaming begins. */
+function logMicStream(stream: MediaStream, label: string): void {
+  const tracks = stream.getAudioTracks();
+  log(label, `— ${tracks.length} audio track(s)`);
+  for (const track of tracks) {
+    log(
+      `  track: readyState=${track.readyState} enabled=${track.enabled} muted=${track.muted} label="${track.label}"`
+    );
+  }
+}
+
 async function getMicStream(): Promise<MediaStream> {
   if (!navigator.mediaDevices?.getUserMedia) {
-    devLog("mic permission DENIED — getUserMedia unsupported");
-    const e = new Error("Microphone access is not supported in this browser.");
-    e.name = "NotSupportedError";
-    throw e;
+    throw new SpeechError("unavailable", "Microphone access is not supported in this browser.", "NotSupportedError");
   }
   try {
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
-    devLog("mic permission GRANTED", `audio tracks: ${stream.getAudioTracks().length}`);
+    log("MIC_PERMISSION_GRANTED — Microphone permission granted");
+    logMicStream(stream, "MIC_STREAM_STARTED — Microphone stream started");
     return stream;
   } catch (err) {
     const name = err instanceof DOMException ? err.name : err instanceof Error ? err.name : "UnknownError";
-    devLog("mic permission DENIED", name);
-    const e = new Error("Microphone access was denied. Allow microphone access and try again.");
-    e.name = name; // preserved so the UI can show precise recovery steps
-    throw e;
+    warnLog("Microphone access failed:", name);
+    throw new SpeechError(micFailureKind(name), micFailureMessage(name), name);
   }
 }
 
-interface ActiveSession {
-  ws: WebSocket;
-  ctx: AudioContext;
-  source: MediaStreamAudioSourceNode;
-  processor: ScriptProcessorNode;
-  stream: MediaStream;
-  onEvent: (e: SpeechEvent) => void;
-  onFinal: (text: string, durationMs: number) => void;
-  startedAt: number;
-  gotAnything: boolean;
-  tornDown: boolean;
-  timers: ReturnType<typeof setTimeout>[];
+/* ------------------------------------------------------------------ */
+/* Web Speech API (fallback engine) support                            */
+/* ------------------------------------------------------------------ */
+
+/** Minimal typing — the Web Speech API surface we actually use. */
+export interface WebSpeechRecognitionLike {
+  lang: string;
+  continuous: boolean;
+  interimResults: boolean;
+  maxAlternatives?: number;
+  start(): void;
+  stop(): void;
+  abort(): void;
+  onstart: (() => void) | null;
+  onresult: ((ev: unknown) => void) | null;
+  onerror: ((ev: unknown) => void) | null;
+  onend: (() => void) | null;
 }
+
+type WebSpeechCtor = new () => WebSpeechRecognitionLike;
+
+export function browserSpeechSupported(): boolean {
+  if (typeof window === "undefined") return false;
+  const w = window as unknown as { SpeechRecognition?: unknown; webkitSpeechRecognition?: unknown };
+  return Boolean(w.SpeechRecognition || w.webkitSpeechRecognition);
+}
+
+function getSpeechCtor(): WebSpeechCtor | null {
+  if (typeof window === "undefined") return null;
+  const w = window as unknown as {
+    SpeechRecognition?: WebSpeechCtor;
+    webkitSpeechRecognition?: WebSpeechCtor;
+  };
+  return w.SpeechRecognition ?? w.webkitSpeechRecognition ?? null;
+}
+
+function webSpeechResultOf(event: unknown): {
+  resultIndex: number;
+  results: Array<{ isFinal: boolean; transcript: string }>;
+} {
+  const ev = event as {
+    resultIndex?: number;
+    results?: ArrayLike<{ isFinal?: boolean; [index: number]: { transcript?: string } }>;
+  };
+  const out: Array<{ isFinal: boolean; transcript: string }> = [];
+  const list = ev.results;
+  if (list) {
+    for (let i = 0; i < list.length; i++) {
+      const item = list[i];
+      out.push({ isFinal: Boolean(item?.isFinal), transcript: item?.[0]?.transcript ?? "" });
+    }
+  }
+  return { resultIndex: ev.resultIndex ?? 0, results: out };
+}
+
+/** Web Speech `error` code → SpeechError-ish mapping for the UI. */
+function webSpeechErrName(code: string): { kind: SpeechErrorKind; name: string; message: string } {
+  switch (code) {
+    case "not-allowed":
+    case "service-not-allowed":
+      return {
+        kind: "permission",
+        name: "NotAllowedError",
+        message: "Microphone access is blocked. Turn on the microphone for this site, then try again.",
+      };
+    case "audio-capture":
+      return {
+        kind: "unavailable",
+        name: "NotFoundError",
+        message: "Your microphone isn't responding. Check it's connected, then try again.",
+      };
+    case "no-speech":
+      return { kind: "stt", name: "no-speech", message: "I couldn't hear anything — please try again." };
+    case "network":
+      return { kind: "network", name: "NetworkError", message: "Speech recognition lost its connection — please try again." };
+    case "aborted":
+      return { kind: "stt", name: "aborted", message: "Speech recognition was interrupted." };
+    default:
+      return { kind: "stt", name: code || "SpeechRecognitionError", message: "Speech recognition failed — please try again." };
+  }
+}
+
+/* ------------------------------------------------------------------ */
+/* Wire-format parsers (Speechmatics v2)                               */
+/* ------------------------------------------------------------------ */
 
 interface WordResult {
   type?: string;
@@ -161,6 +343,40 @@ function errorDetail(msg: Record<string, unknown>): string {
   return [type, code, reason].filter((v): v is string => Boolean(v)).join(" | ") || "unknown error";
 }
 
+/* ------------------------------------------------------------------ */
+/* Session model                                                       */
+/* ------------------------------------------------------------------ */
+
+export interface StartOptions {
+  onEvent: (e: SpeechEvent) => void;
+  onFinal: (text: string, durationMs: number) => void;
+}
+
+interface ActiveSession {
+  readonly engine: "speechmatics" | "browser";
+  readonly startedAt: number;
+  timers: ReturnType<typeof setTimeout>[];
+  tornDown: boolean;
+  stop(): Promise<void>;
+}
+
+interface SpeechmaticsSession extends ActiveSession {
+  readonly engine: "speechmatics";
+  ws: WebSocket;
+  ctx: AudioContext;
+  source: MediaStreamAudioSourceNode;
+  processor: ScriptProcessorNode;
+  stream: MediaStream;
+  gotAnything: boolean;
+  endedSent: boolean;
+}
+
+interface BrowserSession extends ActiveSession {
+  readonly engine: "browser";
+  recognition: WebSpeechRecognitionLike;
+  speechSeen: boolean;
+}
+
 export class SpeechService {
   private session: ActiveSession | null = null;
   /** Mic stream acquired via requestPermission() and reused across STT sessions
@@ -180,23 +396,24 @@ export class SpeechService {
 
   /** Explicitly acquire microphone permission BEFORE any speech-to-text call.
    *  Must run from a user gesture so the browser shows its permission dialog;
-   *  the UI explains why WAYLO needs the mic before invoking this. The held
-   *  stream is reused by start(), so no second dialog appears later. */
+   *  the UI explains why WAYLO needs the mic before invoking this. */
   async requestPermission(): Promise<void> {
     if (this.micPermissionHeld) return;
     try {
       this.heldStream = await getMicStream();
     } catch (err) {
-      if (err instanceof Error && err.name === "OverconstrainedError") {
+      const prepared = asSpeechError(err);
+      if (prepared.name === "OverconstrainedError") {
         // A few devices reject specific audio constraints — fall back to defaults.
         try {
           this.heldStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          log("MIC_PERMISSION_GRANTED — Microphone permission granted (default constraints)");
           return;
         } catch {
           /* fall through to re-throw the original error */
         }
       }
-      throw err;
+      throw prepared;
     }
   }
 
@@ -207,195 +424,34 @@ export class SpeechService {
     this.heldStream = null;
   }
 
-  async start(opts: {
-    onEvent: (e: SpeechEvent) => void;
-    onFinal: (text: string, durationMs: number) => void;
-  }): Promise<void> {
+  async start(opts: StartOptions): Promise<void> {
     await this.stop();
 
-    const { token } = await fetchToken(); // never logged
-    const startedAt = performance.now();
-    const ws = new WebSocket(`${WS_ENDPOINT}?jwt=${token}`);
-    ws.binaryType = "arraybuffer";
-
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("Could not reach the speech service.")), 10_000);
-      ws.onopen = () => {
-        clearTimeout(timer);
-        devLog("WebSocket OPENED");
-        resolve();
-      };
-      ws.onerror = () => {
-        clearTimeout(timer);
-        devLog("WebSocket error — connection failed");
-        reject(new Error("Could not reach the speech service."));
-      };
-    });
-
-    ws.send(
-      JSON.stringify({
-        type: "start-recognition",
-        audio_format: { type: "raw", encoding: "pcm_s16le", sample_rate: TARGET_RATE },
-        transcription_config: { language: STT_LANGUAGE, enable_partials: true, max_delay: 1 },
-      })
-    );
-
-    // `session`/`recognitionStarted` must exist before `ws.onmessage` is set so
-    // a fast RecognitionStarted can never be missed while the mic is starting.
-    let session: ActiveSession | null = null;
-    let recognitionStarted = false;
-
-    ws.onmessage = (ev) => {
-      if (typeof ev.data !== "string") return; // server sends JSON only
-      let msg: Record<string, unknown>;
-      try {
-        msg = JSON.parse(ev.data) as Record<string, unknown>;
-      } catch {
-        return;
-      }
-      const kind = typeof msg.message === "string" ? msg.message : "";
-      const text = transcriptOf(msg);
-
-      switch (kind) {
-        case "RecognitionStarted":
-          // Gate: do not stream any mic audio until the session is live.
-          recognitionStarted = true;
-          devLog("RecognitionStarted received");
-          break;
-
-        case "AddPartialTranscript":
-          devLog("AddPartialTranscript received", text ? `"${text}"` : "(no text yet)");
-          if (!session || session.tornDown) return;
-          if (text) opts.onEvent({ type: "partial", text });
-          break;
-
-        case "AddTranscript":
-          devLog("AddTranscript received", text ? `"${text}"` : "(empty)");
-          if (!session || session.tornDown) return;
-          if (text) {
-            session.gotAnything = true;
-            const durationMs = Math.max(0, Math.round(performance.now() - startedAt));
-            opts.onEvent({ type: "final", text, durationMs });
-            opts.onFinal(text, durationMs);
-            void this.stop();
-          }
-          break;
-
-        case "EndOfTranscript":
-          devLog("EndOfTranscript received");
-          break;
-
-        case "Error":
-          devLog("Speechmatics error:", errorDetail(msg));
-          if (session) {
-            opts.onEvent({ type: "error", message: "The speech service reported a problem. Please try again." });
-            void this.stop();
-          } else {
-            try {
-              ws.close();
-            } catch {
-              /* noop */
-            }
-          }
-          break;
-
-        default:
-          // Unknown keep-alive / system messages are ignored.
-          break;
-      }
-    };
-
-    ws.onclose = () => {
-      devLog("WebSocket CLOSED");
-      if (session) this.teardown(session);
-    };
-
-    let stream: MediaStream;
+    // 1) Speechmatics is the primary engine. No mic prompt is fired until a
+    //    session that can actually consume audio exists.
     try {
-      // Reuse the held permission stream when present (granted via
-      // requestPermission) — never prompt twice in one app session.
-      stream = this.heldStream ?? (this.heldStream = await getMicStream());
+      const session = await this.startSpeechmatics(opts);
+      this.session = session;
+      return;
     } catch (err) {
-      try {
-        ws.close();
-      } catch {
-        /* noop */
-      }
-      throw err;
+      const first = asSpeechError(err);
+      // Mic-level failures are final — no engine can work around them.
+      if (first.kind === "permission" || first.kind === "unavailable") throw first;
+      warnLog("Speechmatics path failed before any speech —", first.message);
+      if (!browserSpeechSupported()) throw first;
     }
 
-    const Ctor =
-      window.AudioContext ??
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const ctx = new Ctor();
-    await ctx.resume();
-    devLog("AudioContext sample rate:", ctx.sampleRate, "Hz");
-
-    // Build the muted graph. CRITICAL: the MediaStreamSourceNode's return value
-    // is stored and connected to the ScriptProcessor, otherwise the processor
-    // never receives any microphone audio.
-    const source = ctx.createMediaStreamSource(stream);
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    const mute = ctx.createGain();
-    mute.gain.value = 0;
-    source.connect(processor);
-    processor.connect(mute);
-    mute.connect(ctx.destination);
-
-    session = {
-      ws,
-      ctx,
-      source,
-      processor,
-      stream,
-      onEvent: opts.onEvent,
-      onFinal: opts.onFinal,
-      startedAt,
-      gotAnything: false,
-      tornDown: false,
-      timers: [],
-    };
+    // 2) Browser-native Web Speech API fallback.
+    log("Speechmatics unavailable — falling back to the browser's built-in speech recognition");
+    const session = await this.startBrowserSpeech(opts);
     this.session = session;
-
-    const resample = makeResampler(ctx.sampleRate);
-    processor.onaudioprocess = (e) => {
-      if (!session || session.tornDown) return;
-      if (!recognitionStarted) return; // no audio until RecognitionStarted
-      const pcm = resample(e.inputBuffer.getChannelData(0));
-      if (pcm.length === 0 || ws.readyState !== WebSocket.OPEN) return;
-      ws.send(pcm.buffer as ArrayBuffer);
-      devLog("PCM chunk sent:", pcm.byteLength, "bytes");
-    };
-
-    // Fallback timers: idle-silence gate + hard utterance cap.
-    session.timers.push(
-      setTimeout(() => {
-        if (this.session === session && !session.gotAnything) {
-          opts.onEvent({ type: "error", message: "I couldn't hear anything — please try again." });
-          void this.stop();
-        }
-      }, STT_IDLE_TIMEOUT_MS + 3000),
-      setTimeout(() => {
-        if (this.session === session) void this.stop();
-      }, STT_MAX_UTTERANCE_MS)
-    );
-
-    opts.onEvent({ type: "started" });
   }
 
   /** Gracefully end the current utterance, flush the final transcript, close. */
   async stop(): Promise<void> {
     const session = this.session;
     if (!session || session.tornDown) return;
-    if (session.ws.readyState === WebSocket.OPEN) {
-      try {
-        session.ws.send(JSON.stringify({ type: "end-of-stream" }));
-      } catch {
-        /* noop */
-      }
-    }
-    await new Promise((r) => setTimeout(r, 350));
-    this.teardown(session);
+    await session.stop();
   }
 
   private teardown(session: ActiveSession): void {
@@ -403,41 +459,86 @@ export class SpeechService {
     session.tornDown = true;
     if (this.session === session) this.session = null;
     session.timers.forEach(clearTimeout);
+  }
 
-    // 1) Stop the microphone tracks — unless they belong to the held permission
-    //    stream, which stays live for the rest of the app session.
-    if (session.stream !== this.heldStream) {
-      devLog("Stopping microphone tracks");
-      session.stream.getTracks().forEach((t) => t.stop());
+  /* ---------------- Speechmatics (primary) ---------------- */
+
+  private async startSpeechmatics(opts: StartOptions): Promise<SpeechmaticsSession> {
+    const { token } = await fetchToken(); // never logged
+    const startedAt = performance.now();
+
+    log("Fetching recognition token OK — opening WebSocket");
+    const ws = new WebSocket(`${WS_ENDPOINT}?jwt=${token}`);
+    ws.binaryType = "arraybuffer";
+
+    // Wait for the socket to open…
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        warnLog("WebSocket connect timed out — verify the Speechmatics region matches your API key");
+        reject(new SpeechError("network", "Could not reach the speech service.", "NetworkError"));
+      }, WS_CONNECT_TIMEOUT_MS);
+      ws.onopen = () => {
+        clearTimeout(timer);
+        log("WEBSOCKET_CONNECTED — Speech recognition service reached");
+        resolve();
+      };
+      ws.onerror = () => {
+        clearTimeout(timer);
+        warnLog("WebSocket connection failed before it opened");
+        reject(new SpeechError("network", "Could not reach the speech service.", "NetworkError"));
+      };
+    });
+
+    // Attach the start-phase message handler BEFORE sending start-recognition so
+    // a fast RecognitionStarted (or an early Error) can never be missed.
+    let recognitionStarted = false;
+    let runtimeError: SpeechError | null = null;
+    const opened = new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new SpeechError("stt", "The speech service didn't respond.", "TimeoutError"));
+      }, START_TIMEOUT_MS);
+      const done = (): void => {
+        clearTimeout(timer);
+        resolve();
+      };
+      ws.onmessage = (ev) => {
+        if (typeof ev.data !== "string") return;
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(ev.data) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+        const kind = typeof msg.message === "string" ? msg.message : "";
+        if (kind === "RecognitionStarted") {
+          recognitionStarted = true;
+          log("RecognitionStarted — Listening…");
+          done();
+          return;
+        }
+        if (kind === "Error") {
+          const detail = errorDetail(msg);
+          warnLog("Speechmatics start error:", detail);
+          runtimeError = new SpeechError("network", `The speech service couldn't start (${detail}).`, "SpeechmaticsError");
+          fail(runtimeError);
+          try {
+            ws.close();
+          } catch {
+            /* noop */
+          }
+          return;
+        }
+        // Partial/final transcripts arriving extremely early are kept for the
+        // runtime handler below (start() consuming them would drop them).
+      };
+    });
+    ws.send(JSON.stringify({ type: "start-recognition", ... }));
+    await opened;
+
+    if (!recognitionStarted) {
+      throw new SpeechError("network", "The speech service didn't start.", "SpeechmaticsError");
     }
 
-    // 2) Disconnect the Web Audio graph: source then processor.
-    try {
-      session.source.disconnect();
-    } catch {
-      /* noop */
-    }
-    try {
-      session.processor.onaudioprocess = null;
-      session.processor.disconnect();
-    } catch {
-      /* noop */
-    }
-
-    // 3) Close the AudioContext.
-    void session.ctx.close().catch(() => undefined);
-
-    // 4) Close the WebSocket.
-    try {
-      if (session.ws.readyState === WebSocket.OPEN || session.ws.readyState === WebSocket.CONNECTING) {
-        devLog("Closing WebSocket");
-        session.ws.close();
-      }
-    } catch {
-      /* noop */
-    }
+    ...
   }
 }
-
-/** Singleton — the app talks to one SpeechService instance. */
-export const speechService = new SpeechService();

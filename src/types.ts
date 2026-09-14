@@ -108,10 +108,13 @@ export interface WayloError {
   id: number;
 }
 
-/** Speech service events (all Speechmatics knowledge stays in SpeechService). */
+/** Speech service events (all speech-provider knowledge stays in SpeechService).
+ * `name` on an error is the underlying error name (NotAllowedError, NotFoundError,
+ * no-speech, NetworkError…) so the UI can classify permission vs availability vs
+ * recognition failures — never guessed from message text. */
 export type SpeechEvent =
   | { type: "partial"; text: string }
   | { type: "final"; text: string; durationMs: number }
   | { type: "started" }
   | { type: "ended" }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string; name?: string };
