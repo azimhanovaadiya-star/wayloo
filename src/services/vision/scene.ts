@@ -66,6 +66,8 @@ export function buildScene(
   return {
     timestamp: new Date().toISOString(),
     objects,
+    frameWidth,
+    frameHeight,
     backend,
     modelLabel,
   };

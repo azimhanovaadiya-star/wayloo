@@ -7,6 +7,13 @@
  * Natural-language goal: sound like a calm human assistant — group nearby
  * objects, say each direction once, stay concise for TTS. Accuracy > clarity >
  * natural language > vocabulary variety.
+ *
+ * Spatial model (voice-first): a detected object is located BOTH by a direction
+ * (left / right / directly ahead / near the top or bottom) AND by a clock
+ * position derived from its box centroid against the frame:
+ *   12 o'clock = directly ahead · 10–11 = front-left · 1–2 = front-right
+ *   9 = left · 3 = right — "around X" whenever the box doesn't support an
+ *   exact hour, plus a vertical hint when the object sits high or low.
  */
 
 import type { DetectedObject, Intent, Scene, WayloResponse, WayloTurn } from "../../types";
@@ -20,12 +27,14 @@ export interface QueryContext {
 const READ_TEXT_RE =
   /(read (this|that|the|it)|read( the)? (text|sign|label|menu|writing|print)|what does (it|this|that|the (sign|label|text)) say|what('s| is) written|ocr)/i;
 const SCENE_RE =
-  /(what(?:’|')?s|what is) (in front|around|here|nearby|outside)|what do (you|i) see|what am i looking at|describe|scene|tell me about (the )?(room|scene|view|environment|surroundings)|is there anything (in front|around)|anything in (my|the) way|what'?s here/i;
+  /(what(?:’|')?s|what is) (in front|around|here|nearby|outside)|what do (you|i) see|what am i looking at|describe|scene|tell me about (the )?(room|scene|view|environment|surroundings)|is there anything (in front|around|above|below)|anything in (my|the) way|what'?s here/i;
 /** "What's on my left?" — side-specific scene question. */
 const SIDE_RE = /(?:on|to) (?:my|your) (?:left|right)(?: side)?/i;
+/** "What's above me?" / "What's below me?" — vertical-zone scene question. */
+const VERT_RE = /(?:what(?:'s| is)|anything) (?:above|below|under|over) (?:me|us|my (?:head|feet))|(?:above|below) me/i;
 const SPATIAL_RE = /(left|right|side|corner|which (side|way)|position of)/i;
 const FIND_RE =
-  /(where|find|look(ing)? for|do you (see|spot|have)|is there|is my|have you seen|locate|can you (see|find|spot)|find me)/i;
+  /(where|find|look(?:ing)? for|do you (see|spot|have)|is there|is my|have you seen|locate|can you (see|find|spot)|find me)/i;
 const OBSTACLE_RE =
   /(obstacle|block(ing|ed|s)?|in (my|the) way|clear path|walkable|bump into|stair|step|doorway)/i;
 const IDENTIFY_RE =
@@ -38,9 +47,10 @@ const POLAR_RE =
 function classifyIntent(query: string): Intent {
   const q = query.toLowerCase();
   if (READ_TEXT_RE.test(q)) return "READ_TEXT";
-  if (SCENE_RE.test(q)) return "SCENE_DESCRIPTION";
+  if (VERT_RE.test(q)) return "SCENE_DESCRIPTION";
   if (SIDE_RE.test(q)) return "SCENE_DESCRIPTION";
-  if (SPATIAL_RE.test(q) && (FIND_RE.test(q) || SPATIAL_RE.test(q))) return "SPATIAL_QUERY";
+  if (SCENE_RE.test(q)) return "SCENE_DESCRIPTION";
+  if (SPATIAL_RE.test(q)) return "SPATIAL_QUERY";
   if (FIND_RE.test(q)) return "FIND_OBJECT";
   if (OBSTACLE_RE.test(q)) return "OBSTACLE_QUERY";
   if (IDENTIFY_RE.test(q)) return "IDENTIFY_OBJECT";
@@ -55,8 +65,8 @@ function norm(s: string): string {
 export function extractTargetPhrase(query: string): string | null {
   const q = norm(query);
   const patterns = [
-    /(?:where(?:'s| is)|where|find|look(?:ing)? for|do you see|can you (?:see|find|spot)|have you seen|find me|is there|is my)\s+(?:(?:the|a|an|my|your|our|his|her|their)\s+)?([a-z]{2,30}(?:\s+[a-z]{2,30}){0,3})(?=\s+(?:in|on|near|next|beside|behind|under|outside|inside|to|at|the|around)\b|$|\.)/i,
-    /(?:which side (?:is|of|s)|on which side is)\s+(?:(?:the|a|an)\s+)?([a-z]{2,30})/i,
+    /(?:where(?:'s| is)|where|find|look(?:ing)? for|do you see|can you (?:see|find|spot)|have you seen|find me|is there|is my)\s+(?:(?:the|a|an|my|your|our|his|her|their|any)\s+)?([a-z]{2,30}(?:\s+[a-z]{2,30}){0,4})(?=\s+(?:in|on|near|next|beside|behind|under|outside|inside|to|at|the|around)\b|$|\.|\?)/i,
+    /(?:which side (?:is|of)|on which side is)\s+(?:(?:the|a|an)\s+)?([a-z]{2,30})/i,
   ];
   for (const p of patterns) {
     const m = q.match(p);
@@ -75,7 +85,7 @@ export function canonicalForWord(word: string): string | null {
   return null;
 }
 
-/** Match a target phrase against the scene; returns matches (prominence-sorted). */
+/** Match a target phrase against the scene; returns ALL matches (prominence-sorted). */
 export function resolveObjects(phrase: string, scene: Scene): DetectedObject[] {
   const canonical = canonicalForWord(phrase);
   const words = norm(phrase).split(" ").filter((w) => w.length > 2);
@@ -87,28 +97,183 @@ export function resolveObjects(phrase: string, scene: Scene): DetectedObject[] {
 }
 
 /* ------------------------------------------------------------------------ *
- * Natural vocabulary — deterministic, chosen for the situation, never random.
+ * Spatial vocabulary — direction + clock + vertical depth + relationship.
  * ------------------------------------------------------------------------ */
 
 type Position = DetectedObject["position"];
 
-/** Where the group sits, phrased as a natural trailing clause. */
-const POS_TAIL: Record<Position, string> = {
-  center: "directly in front of you",
-  left: "on your left",
-  right: "on your right",
-  // Lower in the frame = closer to the camera in a forward-facing view.
-  below: "a bit lower down, close by",
-  above: "up above you",
-};
+/** Frame dimensions — real when present, otherwise inferred from boxes. */
+function frameSize(scene: Scene): { w: number; h: number } {
+  const w = scene.frameWidth > 0 ? scene.frameWidth : Math.max(1, ...scene.objects.map((o) => o.bbox[2]));
+  const h = scene.frameHeight > 0 ? scene.frameHeight : Math.max(1, ...scene.objects.map((o) => o.bbox[3]));
+  return { w, h };
+}
 
-/** "slightly to your left/right" only when the box visibly hugs the middle. */
-function posTailFor(o: DetectedObject, frameWidth: number): string {
-  const cx = (o.bbox[0] + o.bbox[2]) / 2;
-  const frac = frameWidth > 0 ? cx / frameWidth : 0;
-  if (o.position === "left" && frac > 0.28 && frac < 0.42) return "slightly to your left";
-  if (o.position === "right" && frac > 0.58 && frac < 0.72) return "slightly to your right";
-  return POS_TAIL[o.position];
+function centroid(o: DetectedObject): { fx: number; fy: number } {
+  const [x1, y1, x2, y2] = o.bbox;
+  return { fx: (x1 + x2) / 2, fy: (y1 + y2) / 2 };
+}
+
+/**
+ * Clock hour of an object's horizontal centroid — a linear map of frame width
+ * onto the clock face around the user: far-left → 9, centre → 12, far-right → 15 (3).
+ */
+function clockHour(o: DetectedObject, frameW: number): number {
+  const { fx } = centroid(o);
+  const cx = frameW > 0 ? Math.min(1, Math.max(0, fx / frameW)) : 0.5;
+  return 9 + 6 * cx;
+}
+
+/** Human clock phrase from the hour number ("around 10 o'clock", "around 2 to 3 o'clock"). */
+function clockPhrase(hour: number): string {
+  if (hour < 9.7) return "around 9 o'clock";
+  if (hour < 10.5) return "around 10 o'clock";
+  if (hour < 11.5) return "around 10 to 11 o'clock";
+  if (hour <= 12.5) return "around 12 o'clock";
+  if (hour < 13.5) return "around 1 to 2 o'clock";
+  if (hour < 14.5) return "around 2 to 3 o'clock";
+  return "around 3 o'clock";
+}
+
+/** Direction word for a clock hour — exact only with the bucket, never over-claimed. */
+function directionForHour(hour: number): string {
+  if (hour < 9.7) return "on your far left";
+  if (hour < 10.5) return "on your left";
+  if (hour < 11.5) return "slightly to your left";
+  if (hour <= 12.5) return "directly ahead";
+  if (hour < 13.5) return "slightly to your right";
+  if (hour < 14.5) return "on your right";
+  return "on your far right";
+}
+
+type Loc = { phrase: string; extra: DetectedObject[] };
+
+/** Full spatial clause for one object: direction + clock + vertical depth + relation. */
+function locateObject(target: DetectedObject, scene: Scene): Loc {
+  const { w, h } = frameSize(scene);
+  const { fx, fy } = centroid(target);
+  const hour = clockHour(target, w);
+  const cx = w > 0 ? fx / w : 0.5;
+  const cy = h > 0 ? fy / h : 0.5;
+
+  const direction = directionForHour(hour);
+  const clock = clockPhrase(hour);
+  const depth = cy < 0.28 ? " near the top of your view" : cy > 0.72 ? " near the bottom of your view" : "";
+
+  const rel = locateRelation(target, scene);
+  let relation = "";
+  let extra: DetectedObject[] = [];
+  if (rel) {
+    relation =
+      rel.kind === "below"
+        ? `, below the ${rel.other.name}`
+        : `, ${rel.side === "left" ? "to the left of" : "to the right of"} the ${rel.other.name}`;
+    extra = [rel.other];
+  }
+
+  return {
+    phrase: `${direction}, ${clock}${depth}${relation}`,
+    extra,
+  };
+}
+
+/** The anchor pair for the fallback cx used only when bboxes are degenerate. */
+function cxOf(o: DetectedObject, w: number): number {
+  const { fx } = centroid(o);
+  return w > 0 ? Math.min(1, Math.max(0, fx / w)) : 0.5;
+}
+
+/* ------------------------------------------------------------------ *
+ * Relationship detection — an object lower + overlapping = in front.
+ * ------------------------------------------------------------------ */
+
+type SpatialRel = { other: DetectedObject; kind: "below" | "sameRow"; side?: "left" | "right" };
+
+function locateRelation(target: DetectedObject, scene: Scene): SpatialRel | null {
+  const [tx1, ty1, tx2, ty2] = target.bbox;
+  const tW = tx2 - tx1;
+  const tH = ty2 - ty1;
+  const frameW = frameSize(scene).w;
+  let best: SpatialRel | null = null;
+  let bestScore = 0;
+
+  for (const o of scene.objects) {
+    if (o === target) continue;
+    const [ox1, oy1, ox2, oy2] = o.bbox;
+    const oW = ox2 - ox1;
+    const oH = oy2 - oy1;
+    const xOverlap = Math.max(0, Math.min(tx2, ox2) - Math.max(tx1, ox1));
+    const yOverlap = Math.max(0, Math.min(ty2, oy2) - Math.max(ty1, oy1));
+    // The other object ends above where this one starts → it sits behind/above.
+    if (oy2 <= ty1 + 2 && xOverlap >= 0.3 * Math.min(tW, oW)) {
+      const score = xOverlap / (Math.max(tW, oW) + 1);
+      if (score > bestScore) {
+        best = { other: o, kind: "below" };
+        bestScore = score;
+      }
+      continue;
+    }
+    // Row-sibling: same vertical band, genuinely adjacent horizontally.
+    if (yOverlap >= 0.3 * Math.min(tH, oH)) {
+      const tc = (tx1 + tx2) / 2;
+      const oc = (ox1 + ox2) / 2;
+      const gap = Math.abs(tc - oc);
+      if (gap >= 0.15 * Math.max(tW, oW) && gap <= 0.45 * frameW) {
+        const score = yOverlap / (Math.max(tH, oH) + 1);
+        if (score > bestScore) {
+          best = { other: o, kind: "sameRow", side: tc < oc ? "left" : "right" };
+          bestScore = score;
+        }
+      }
+    }
+  }
+  return bestScore > 0 ? best : null;
+}
+
+/* ------------------------------------------------------------------ *
+ * Grouping — same-position objects combine; direction said once.
+ * ------------------------------------------------------------------ */
+
+interface SceneGroup {
+  position: Position;
+  objs: DetectedObject[];
+  names: Array<{ name: string; count: number }>;
+}
+
+/** Order groups the way a person scans a room: LEFT → CENTER → RIGHT → vertical extras. */
+const GROUP_ORDER: Position[] = ["left", "center", "right", "below", "above"];
+
+function groupByPosition(objs: DetectedObject[]): SceneGroup[] {
+  const groups = new Map<Position, SceneGroup>();
+  for (const o of objs) {
+    const g = groups.get(o.position) ?? { position: o.position, objs: [], names: [] };
+    const entry = g.names.find((e) => e.name === o.name);
+    if (entry) entry.count += 1;
+    else g.names.push({ name: o.name, count: 1 });
+    g.objs.push(o);
+    groups.set(o.position, g);
+  }
+  return GROUP_ORDER.map((p) => groups.get(p)).filter((g) => g !== undefined) as SceneGroup[];
+}
+
+function anchorOf(g: SceneGroup): DetectedObject {
+  return [...g.objs].sort((a, b) => b.area - a.area)[0];
+}
+
+/** Objects lower in the frame AND overlapping the anchor horizontally — in front of it. */
+function frontalCluster(g: SceneGroup): { anchor: DetectedObject; frontal: DetectedObject[] } | null {
+  if (g.position !== "center" || g.objs.length < 2) return null;
+  const anchor = anchorOf(g);
+  const [ax1, , ax2, ay2] = anchor.bbox;
+  const frontal: DetectedObject[] = [];
+  for (const o of g.objs) {
+    if (o === anchor) continue;
+    const [ox1, oy1, ox2] = o.bbox;
+    const overlapX = Math.max(0, Math.min(ax2, ox2) - Math.max(ax1, ox1));
+    const minW = Math.min(ax2 - ax1, ox2 - ox1);
+    if (oy1 >= ay2 && overlapX >= 0.3 * minW && o.area <= anchor.area * 0.95) frontal.push(o);
+  }
+  return frontal.length > 0 ? { anchor, frontal } : null;
 }
 
 function countWord(n: number): string {
@@ -129,177 +294,88 @@ function joinList(items: string[]): string {
   return `${items.slice(0, -1).join(", ")} and ${items[items.length - 1]}`;
 }
 
-/* ------------------------------------------------------------------ *
- * Grouping — same-position objects are combined, direction said once.
- * ------------------------------------------------------------------ */
+const POS_TAIL_STRONG: Record<Position, string> = {
+  center: "directly ahead",
+  left: "on your left",
+  right: "on your right",
+  below: "a bit lower down, close to you",
+  above: "up above you",
+};
 
-interface GroupEntry {
-  name: string;
-  count: number;
+/** Slightly-left/right only when the box really hugs the middle of its side. */
+function posTailFor(o: DetectedObject, scene: Scene): string {
+  const w = frameSize(scene).w;
+  const cx = cxOf(o, w);
+  if (o.position === "left" && cx > 0.28 && cx < 0.42) return "slightly to your left";
+  if (o.position === "right" && cx > 0.58 && cx < 0.72) return "slightly to your right";
+  return POS_TAIL_STRONG[o.position];
 }
 
-interface SceneGroup {
-  position: Position;
-  entries: GroupEntry[];
-  raw: DetectedObject[];
-}
-
-/** Order groups the way a person would describe a view: ahead first. */
-const GROUP_ORDER: Position[] = ["center", "left", "right", "below", "above"];
-
-function groupByPosition(objs: DetectedObject[]): SceneGroup[] {
-  const groups = new Map<Position, SceneGroup>();
-  for (const o of objs) {
-    const g = groups.get(o.position) ?? { position: o.position, entries: [], raw: [] };
-    const entry = g.entries.find((e) => e.name === o.name);
-    if (entry) entry.count += 1;
-    else g.entries.push({ name: o.name, count: 1 });
-    g.raw.push(o);
-    groups.set(o.position, g);
-  }
-  return GROUP_ORDER.map((p) => groups.get(p)).filter((g) => g !== undefined) as SceneGroup[];
-}
-
-/** Largest box in a group — the "anchor" other objects relate to. */
-function anchorOf(g: SceneGroup): DetectedObject {
-  return [...g.raw].sort((a, b) => b.area - a.area)[0];
-}
-
-/**
- * Objects that sit lower in the frame AND overlap the anchor horizontally are
- * literally in front of it — a grounded "with a keyboard in front of it".
- */
-function inFrontCluster(g: SceneGroup): { anchor: DetectedObject; frontal: DetectedObject[] } | null {
-  if (g.position !== "center" || g.raw.length < 2) return null;
-  const anchor = anchorOf(g);
-  const [ax1, , ax2, ay2] = anchor.bbox;
-  const frontal: DetectedObject[] = [];
-  for (const o of g.raw) {
-    if (o === anchor) continue;
-    const [ox1, oy1, ox2] = o.bbox;
-    const overlapX = Math.max(0, Math.min(ax2, ox2) - Math.max(ax1, ox1));
-    const minW = Math.min(ax2 - ax1, ox2 - ox1);
-    const lowerInFrame = oy1 >= ay2;
-    const overlapping = overlapX >= 0.3 * minW;
-    const smaller = o.area <= anchor.area * 0.95;
-    if (lowerInFrame && overlapping && smaller) frontal.push(o);
-  }
-  return frontal.length > 0 ? { anchor, frontal } : null;
-}
-
-function entryText(e: GroupEntry): string {
-  return `${countWord(e.count)} ${plural(e.name, e.count)}`;
-}
-
-/**
- * Plural verb only when the group is genuinely plural ("two mugs", "two mugs and
- * three books"). A mixed list like "a laptop and a keyboard" stays "There's…",
- * which is how a person actually speaks.
- */
-function everyCounted(g: SceneGroup): boolean {
-  return g.entries.length > 0 && g.entries.every((e) => e.count > 1);
-}
-
-function listEntries(entries: GroupEntry[]): string {
-  return joinList(entries.map(entryText));
-}
-
-/**
- * One group → its clause. Only the first group carries the "There's…" verb.
- * `plain` drops the direction words entirely (used for "what's on my left?"
- * answers, where the side is already stated, so we never double it).
- */
-function groupClause(g: SceneGroup, first: boolean, lowConf: boolean, plain: boolean, frameWidth: number): string {
-  const cluster = inFrontCluster(g);
+function groupClause(g: SceneGroup, first: boolean, lowConf: boolean, scene: Scene): string {
+  const cluster = frontalCluster(g);
   if (cluster) {
-    const frontEntries = new Map<string, number>();
-    for (const f of cluster.frontal) frontEntries.set(f.name, (frontEntries.get(f.name) ?? 0) + 1);
-    const frontalText = listEntries([...frontEntries].map(([name, count]) => ({ name, count })));
-    const body = plain
-      ? `a ${cluster.anchor.name}, with ${frontalText} in front of it`
-      : `a ${cluster.anchor.name} ${POS_TAIL.center}, with ${frontalText} in front of it`;
-    return first ? `${lowConf ? "It looks like there's" : "There's"} ${body}` : `and ${body}`;
+    const frontNames = joinList([...new Set(cluster.frontal.map((f) => f.name))].map((n) => `a ${n}`));
+    const verb = lowConf ? "It looks like there's" : "There's";
+    const body = `${verb} a ${cluster.anchor.name} ${POS_TAIL_STRONG.center}, with ${frontNames} in front of it`;
+    return first ? body : `and ${body}`;
   }
-  const verb = lowConf ? (everyCounted(g) ? "It looks like there are" : "It looks like there's")
-    : everyCounted(g) ? "There are" : "There's";
-  const tail = plain ? "" : g.raw.length === 1 ? posTailFor(g.raw[0], frameWidth) : POS_TAIL[g.position];
-  const list = listEntries(g.entries);
-  const body = tail ? `${list} ${tail}` : list;
-  return first ? `${verb} ${body}` : `and ${body}`;
+  const pluralTail = g.names.length > 1 || g.names.some((e) => e.count > 1);
+  const verb = lowConf ? (pluralTail ? "It looks like there are" : "It looks like there's")
+    : pluralTail ? "There are" : "There's";
+  const tail = g.objs.length === 1 ? posTailFor(g.objs[0], scene) : POS_TAIL_STRONG[g.position];
+  const list = joinList(g.names.map((e) => `${countWord(e.count)} ${plural(e.name, e.count)}`));
+  const body = `${verb} ${list} ${tail}`;
+  return body;
 }
 
-/**
- * Compose the whole description from grouped, prominence-kept objects.
- * Groups read ahead-first; the same-position direction is named once per group.
- */
-function describeScene(objs: DetectedObject[], plain = false): string {
-  const groups = groupByPosition(objs);
-  const frameWidth = Math.max(1, ...objs.map((o) => o.bbox[2]));
-  return groups
-    .map((g, i) => groupClause(g, i === 0, objs.every((o) => o.confidence < 0.55), plain, frameWidth))
+/** Whole-scene description: LEFT → CENTER → RIGHT, vertical extras last. */
+function describeScene(objs: DetectedObject[], scene: Scene): string {
+  return groupByPosition(objs)
+    .map((g, i) => groupClause(g, i === 0, objs.every((o) => o.confidence < 0.55), scene))
     .join(", ");
 }
 
 /* ------------------------------------------------------------------ *
- * Spatial phrases — relative to the anchor, from boxes only.
+ * Zone questions ("what's on my left" / "what's above me")            *
  * ------------------------------------------------------------------ */
 
-type SpatialRel = { other: DetectedObject; kind: "below" | "sameRow"; side?: "left" | "right" };
+function requestedZone(query: string): { side?: "left" | "right"; vertical?: "above" | "below" } {
+  const q = query.toLowerCase();
+  const side = q.match(/(?:on|to) (?:my|your) (left|right)(?: side)?/);
+  const vert = q.match(/(?:what(?:'s| is)|anything) (above|below)/) ?? q.match(/\b(above|below)\s+(?:me|us)\b/);
+  return {
+    side: side ? (side[1] as "left" | "right") : undefined,
+    vertical: vert ? (vert[1] as "above" | "below") : undefined,
+  };
+}
 
-function locateRelation(target: DetectedObject, scene: Scene): SpatialRel | null {
-  const [tx1, ty1, tx2, ty2] = target.bbox;
-  const tW = tx2 - tx1;
-  const tH = ty2 - ty1;
-  const best: SpatialRel[] = [];
-  for (const o of scene.objects) {
-    if (o === target) continue;
-    const [ox1, oy1, ox2, oy2] = o.bbox;
-    const oW = ox2 - ox1;
-    const oH = oy2 - oy1;
-    const xOverlap = Math.max(0, Math.min(tx2, ox2) - Math.max(tx1, ox1));
-    const yOverlap = Math.max(0, Math.min(ty2, oy2) - Math.max(ty1, oy1));
-    // The other object ends above where this one starts → it sits behind/above.
-    if (oy2 <= ty1 + 2 && xOverlap >= 0.3 * Math.min(tW, oW)) {
-      best.push({ other: o, kind: "below" });
-      break; // most informative relation — say "below X" and stop
-    }
-    if (yOverlap >= 0.3 * Math.min(tH, oH)) {
-      const tc = (tx1 + tx2) / 2;
-      const oc = (ox1 + ox2) / 2;
-      const gap = Math.abs(tc - oc);
-      // "just to the left/right of X" only when the two are genuinely adjacent,
-      // not when the target is far away across the frame.
-      if (gap >= 0.15 * Math.max(tW, oW) && gap <= 0.45 * frameWidth(scene)) {
-        best.push({ other: o, kind: "sameRow", side: tc < oc ? "left" : "right" });
-      }
-    }
+function zoneName(zone: "left" | "right" | "above" | "below"): string {
+  switch (zone) {
+    case "left": return "on your left";
+    case "right": return "on your right";
+    case "above": return "above you";
+    case "below": return "below you";
   }
-  return best[0] ?? null;
 }
 
-/** Natural locating clause for a single object ("directly in front of you, below the laptop"). */
-function spatialClause(target: DetectedObject, scene: Scene): { text: string; extra: DetectedObject[] } {
-  const rel = locateRelation(target, scene);
-  const tail = posTailFor(target, frameWidth(scene));
-  if (rel && rel.kind === "below") return { text: `${tail}, below the ${rel.other.name}`, extra: [rel.other] };
-  if (rel && rel.kind === "sameRow") return { text: `just to the ${rel.side} of the ${rel.other.name}`, extra: [rel.other] };
-  return { text: tail, extra: [] };
+function zoneClock(zone: "left" | "right"): string {
+  return zone === "left" ? "around 9 to 10 o'clock" : "around 2 to 3 o'clock";
 }
 
-function frameWidth(scene: Scene): number {
-  return Math.max(1, ...scene.objects.map((o) => o.bbox[2]));
+function zoneList(zone: "left" | "right" | "above" | "below", objs: DetectedObject[]): string {
+  if (objs.length === 0) return `I don't see anything ${zoneName(zone)} right now.`;
+  const list = joinList(objs.slice(0, 5).map((o) => plural(o.name, 1)));
+  const clock = zone === "left" || zone === "right" ? `around ${zone === "left" ? "9 to 10" : "2 to 3"} o'clock, ` : "";
+  return `${zoneName(zone)}${clock ? ", " + clock : ""}there's ${list}.`;
 }
 
 /* ------------------------------------------------------------------ */
 /* Answers                                                             */
 /* ------------------------------------------------------------------ */
 
-function requestedSide(query: string): "left" | "right" | null {
-  const m = query.toLowerCase().match(/(?:on|to) (?:my|your) (left|right)(?: side)?/);
-  return m ? (m[1] as "left" | "right") : null;
-}
-
 function sceneDescription(query: string, scene: Scene): WayloResponse {
+  const zone = requestedZone(query);
+
   if (scene.objects.length === 0) {
     return {
       intent: "SCENE_DESCRIPTION",
@@ -308,61 +384,90 @@ function sceneDescription(query: string, scene: Scene): WayloResponse {
       isMiss: false,
     };
   }
-  const side = requestedSide(query);
-  if (side) {
-    const sideObjs = scene.objects.filter((o) => o.position === side);
-    if (sideObjs.length === 0) {
-      return {
-        intent: "SCENE_DESCRIPTION",
-        text: `I don't see anything on your ${side} right now.`,
-        referencedObjects: [],
-        isMiss: false,
-      };
-    }
+
+  if (zone.side) {
+    const sideObjs = scene.objects
+      .filter((o) => (zone.side === "left" ? o.position === "left" : o.position === "right"))
+      .sort((a, b) => b.area - a.area);
     return {
       intent: "SCENE_DESCRIPTION",
-      text: `On your ${side}, ${describeScene(sideObjs.slice(0, 5), true)}.`,
+      text: zoneList(zone.side, sideObjs.slice(0, 5)),
       referencedObjects: sideObjs.slice(0, 5),
       isMiss: false,
     };
   }
-  const top = scene.objects.slice(0, 5);
+
+  if (zone.vertical) {
+    const zoneObjs = scene.objects
+      .filter((o) => (zone.vertical === "above" ? o.position === "above" : o.position === "below"))
+      .sort((a, b) => b.area - a.area);
+    return {
+      intent: "SCENE_DESCRIPTION",
+      text: zoneList(zone.vertical, zoneObjs.slice(0, 5)),
+      referencedObjects: zoneObjs.slice(0, 5),
+      isMiss: false,
+    };
+  }
+
+  const top = scene.objects.slice(0, 7);
   return {
     intent: "SCENE_DESCRIPTION",
-    text: `${describeScene(top)}.`,
+    text: `${describeScene(top, scene)}.`,
     referencedObjects: top,
     isMiss: false,
   };
 }
 
+/** "Your phone" when the user asked "my phone", "The phone" otherwise. */
+function pronounFor(query: string): string {
+  return /\b(my|our)\b/.test(query.toLowerCase()) ? "Your" : "The";
+}
+
 function findObjectAnswer(query: string, phrase: string, scene: Scene): WayloResponse {
   const found = resolveObjects(phrase, scene);
-  const target = found[0];
-  const polar = POLAR_RE.test(query.trim()) && !/which (side|one|way)|where/i.test(query);
-  if (!target) {
+  const polar = POLAR_RE.test(query.trim()) && !/which (side|position)|where/i.test(query);
+
+  if (found.length === 0) {
     return {
       intent: "FIND_OBJECT",
-      text: polar
-        ? `No — I can't see ${phrase} in the current view.`
-        : `I can't see ${phrase} in the current view. It may be outside the frame or hidden behind something.`,
+      text: polar ? `No — I can't see ${phrase} in the current view.` : `I can't see ${phrase} in the current view.`,
       referencedObjects: [],
       isMiss: true,
     };
   }
-  const clause = spatialClause(target, scene);
-  // The noun always comes from the scene ("bottle", never the user's "water bottle"),
-  // so claims stay exactly as accurate as the detection.
-  const text = polar ? `Yes, there's a ${target.name} ${clause.text}.` : `The ${target.name} is ${clause.text}.`;
-  return {
-    intent: "FIND_OBJECT",
-    text,
-    referencedObjects: [target, ...clause.extra],
-    isMiss: false,
-  };
+
+  // Multiple instances of the same object — name each spot, left → right.
+  if (found.length > 1 && new Set(found.map((o) => o.name)).size === 1) {
+    const ordered = [...found].sort(
+      (a, b) => (a.bbox[0] + a.bbox[2]) / 2 - (b.bbox[0] + b.bbox[2]) / 2
+    );
+    const name = found[0].name;
+    const spots = ordered.map((o) => locateObject(o, scene).phrase);
+    const text =
+      found.length === 2
+        ? `I can see two ${plural(name, 2)}. One is ${spots[0]}, and another is ${spots[1]}.`
+        : `I can see ${countWord(found.length)} ${plural(name, found.length)}. One is ${spots[0]}, another is ${spots[1]}, and another is ${spots[2]}.`;
+    return { intent: "FIND_OBJECT", text, referencedObjects: ordered, isMiss: false };
+  }
+
+  const target = found[0];
+  const loc = locateObject(target, scene);
+  const name = target.name;
+  const partial = target.confidence < 0.62;
+  const text = polar
+    ? partial
+      ? `Yes — I can partially see a ${name} ${loc.phrase}.`
+      : `Yes, there's a ${name} ${loc.phrase}.`
+    : partial
+      ? `I can partially see what appears to be a ${name} ${loc.phrase}.`
+      : `${pronounFor(query)} ${name} is ${loc.phrase}.`;
+
+  return { intent: "FIND_OBJECT", text, referencedObjects: [target, ...loc.extra], isMiss: false };
 }
 
 function spatialAnswer(phrase: string, scene: Scene): WayloResponse {
-  const target = resolveObjects(phrase, scene)[0];
+  const found = resolveObjects(phrase, scene);
+  const target = found[0];
   if (!target) {
     return {
       intent: "SPATIAL_QUERY",
@@ -371,11 +476,11 @@ function spatialAnswer(phrase: string, scene: Scene): WayloResponse {
       isMiss: true,
     };
   }
-  const clause = spatialClause(target, scene);
+  const loc = locateObject(target, scene);
   return {
     intent: "SPATIAL_QUERY",
-    text: `The ${target.name} is ${clause.text}.`,
-    referencedObjects: [target, ...clause.extra],
+    text: `The ${target.name} is ${loc.phrase}.`,
+    referencedObjects: [target, ...loc.extra],
     isMiss: false,
   };
 }
@@ -390,7 +495,7 @@ function identifyObject(scene: Scene): WayloResponse {
     };
   }
   const target = [...scene.objects].sort((a, b) => b.area - a.area)[0];
-  const tail = POS_TAIL[target.position];
+  const tail = POS_TAIL_STRONG[target.position];
   const text =
     target.confidence < 0.62
       ? `That looks like a ${target.name}, ${tail}.`
@@ -427,10 +532,9 @@ function generalAnswer(scene: Scene): WayloResponse {
     };
   }
   const top = scene.objects.slice(0, 3);
-  const sceneText = describeScene(top);
   return {
     intent: "GENERAL_VISUAL_QUERY",
-    text: `Right now, ${sceneText.charAt(0).toLowerCase() + sceneText.slice(1)}. Ask me "where is" one of them and I'll point it out.`,
+    text: `${describeScene(top, scene)}. Ask me "where is" a specific thing and I'll tell you the spot.`,
     referencedObjects: top,
     isMiss: false,
   };
@@ -438,7 +542,7 @@ function generalAnswer(scene: Scene): WayloResponse {
 
 /** Resolve pronouns / "the same one" against recent turns. */
 function resolveReference(query: string, ctx: QueryContext): string {
-  if (!/(it|that one|this one|the same|those|them|him|her|el|del)\b/.test(query.toLowerCase())) return query;
+  if (!/(it|that one|this one|the same|those|them|him|her)\b/.test(query.toLowerCase())) return query;
   for (let i = ctx.history.length - 1; i >= 0; i--) {
     const referenced = ctx.history[i].response.referencedObjects[0];
     if (referenced) return referenced.name;

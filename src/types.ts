@@ -24,7 +24,11 @@ export interface DetectedObject {
 export interface Scene {
   timestamp: string;
   objects: DetectedObject[];
-  /** Which engine produced it ("local" | "sima") — shown honestly in demo mode. */
+  /** Width (px) of the analysed camera frame — used for direction/clock math. */
+  frameWidth: number;
+  /** Height (px) of the analysed camera frame — used for direction/clock math. */
+  frameHeight: number;
+  /** Which engine produced it ("local" | "sima") — shown by demo mode. */
   backend: VisionBackendId;
   /** Human label of the model, e.g. "COCO-SSD (TensorFlow.js)". */
   modelLabel: string;
