@@ -135,15 +135,30 @@ function clockPhrase(hour: number): string {
   return "around 3 o'clock";
 }
 
-/** Direction word for a clock hour — exact only with the bucket, never over-claimed. */
-function directionForHour(hour: number): string {
-  if (hour < 9.7) return "on your far left";
-  if (hour < 10.5) return "on your left";
-  if (hour < 11.5) return "slightly to your left";
-  if (hour <= 12.5) return "directly ahead";
-  if (hour < 13.5) return "slightly to your right";
-  if (hour < 14.5) return "on your right";
-  return "on your far right";
+/**
+ * Direction word, derived from the detected POSITION band (which the vision
+ * layer computes frame-relative and stays correct even when real frame
+ * dimensions are missing), with a subtle inboard nuance for boxes that hug the
+ * inner edge of their side. The clock phrase below stays frame-derived and is
+ * purely auxiliary — never the source of a left/right claim.
+ */
+function directionForPosition(o: DetectedObject, frameW: number): string {
+  switch (o.position) {
+    case "center":
+      return "directly ahead";
+    case "left": {
+      const cx = cxOf(o, frameW);
+      return cx > 0.28 && cx < 0.42 ? "slightly to your left" : "on your left";
+    }
+    case "right": {
+      const cx = cxOf(o, frameW);
+      return cx > 0.58 && cx < 0.72 ? "slightly to your right" : "on your right";
+    }
+    case "below":
+      return "down closer to you";
+    case "above":
+      return "up above you";
+  }
 }
 
 type Loc = { phrase: string; extra: DetectedObject[] };
@@ -151,13 +166,20 @@ type Loc = { phrase: string; extra: DetectedObject[] };
 /** Full spatial clause for one object: direction + clock + vertical depth + relation. */
 function locateObject(target: DetectedObject, scene: Scene): Loc {
   const { w, h } = frameSize(scene);
-  const { fx, fy } = centroid(target);
-  const hour = clockHour(target, w);
-  const cx = w > 0 ? fx / w : 0.5;
+  const { fy } = centroid(target);
   const cy = h > 0 ? fy / h : 0.5;
 
-  const direction = directionForHour(hour);
-  const clock = clockPhrase(hour);
+  const direction = directionForPosition(target.position, w);
+  // Clock: meaningful for left/right (9↔3); for top/bottom the vertical band
+  // already says it, for center "directly ahead" carries the meaning.
+  const clock =
+    target.position === "left" || target.position === "right"
+      ? `, ${clockPhrase(clockHour(target, w))}`
+      : target.position === "below"
+        ? ", down near the ground"
+        : target.position === "above"
+          ? ", up above"
+          : "";
   const depth = cy < 0.28 ? " near the top of your view" : cy > 0.72 ? " near the bottom of your view" : "";
 
   const rel = locateRelation(target, scene);
@@ -172,7 +194,7 @@ function locateObject(target: DetectedObject, scene: Scene): Loc {
   }
 
   return {
-    phrase: `${direction}, ${clock}${depth}${relation}`,
+    phrase: `${direction}${clock}${depth}${relation}`,
     extra,
   };
 }
@@ -311,27 +333,35 @@ function posTailFor(o: DetectedObject, scene: Scene): string {
   return POS_TAIL_STRONG[o.position];
 }
 
-function groupClause(g: SceneGroup, first: boolean, lowConf: boolean, scene: Scene): string {
+function groupClause(g: SceneGroup, lowConf: boolean, scene: Scene): string {
   const cluster = frontalCluster(g);
   if (cluster) {
     const frontNames = joinList([...new Set(cluster.frontal.map((f) => f.name))].map((n) => `a ${n}`));
     const verb = lowConf ? "It looks like there's" : "There's";
     const body = `${verb} a ${cluster.anchor.name} ${POS_TAIL_STRONG.center}, with ${frontNames} in front of it`;
-    return first ? body : `and ${body}`;
+    return body;
   }
-  const pluralTail = g.names.length > 1 || g.names.some((e) => e.count > 1);
-  const verb = lowConf ? (pluralTail ? "It looks like there are" : "It looks like there's")
-    : pluralTail ? "There are" : "There's";
+  // "There are" only when a kind repeats ("two mugs"); a set of different kinds
+  // is a single compound list: "There's a laptop and a keyboard …".
+  const multiple = g.names.some((e) => e.count > 1);
+  const verb = lowConf ? (multiple ? "It looks like there are" : "It looks like there's")
+    : multiple ? "There are" : "There's";
   const tail = g.objs.length === 1 ? posTailFor(g.objs[0], scene) : POS_TAIL_STRONG[g.position];
   const list = joinList(g.names.map((e) => `${countWord(e.count)} ${plural(e.name, e.count)}`));
   const body = `${verb} ${list} ${tail}`;
   return body;
 }
 
-/** Whole-scene description: LEFT → CENTER → RIGHT, vertical extras last. */
+/** Whole-scene description: LEFT → CENTER → RIGHT, vertical extras last,
+ *  connected like a person listing a room ("…, and there's a …"). */
 function describeScene(objs: DetectedObject[], scene: Scene): string {
+  const lowConf = objs.every((o) => o.confidence < 0.55);
   return groupByPosition(objs)
-    .map((g, i) => groupClause(g, i === 0, objs.every((o) => o.confidence < 0.55), scene))
+    .map((g, i) => {
+      const body = groupClause(g, lowConf, scene);
+      if (i === 0) return body;
+      return `and ${body.charAt(0).toLowerCase()}${body.slice(1)}`;
+    })
     .join(", ");
 }
 
@@ -356,10 +386,6 @@ function zoneName(zone: "left" | "right" | "above" | "below"): string {
     case "above": return "above you";
     case "below": return "below you";
   }
-}
-
-function zoneClock(zone: "left" | "right"): string {
-  return zone === "left" ? "around 9 to 10 o'clock" : "around 2 to 3 o'clock";
 }
 
 function zoneList(zone: "left" | "right" | "above" | "below", objs: DetectedObject[]): string {

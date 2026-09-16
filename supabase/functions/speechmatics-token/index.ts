@@ -17,6 +17,11 @@ const CORS_HEADERS = {
 
 const SPEECHMATICS_API_KEY = Deno.env.get("SPEECHMATICS_API_KEY");
 const RT_TOKEN_TTL_SECONDS = 60; // 60-3600 allowed; keep short — mint fresh per session
+const RT_TOKEN_URL = "https://mp.speechmatics.com/v1/api_keys?type=rt";
+/** Bound the upstream call: if Speechmatics stalls, fail fast with a clean 504
+ * instead of hanging the function until the platform kills it (which surfaces
+ * as a raw "ReadTimeout" to the browser). */
+const RT_TOKEN_TIMEOUT_MS = 10_000;
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -70,18 +75,29 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const res = await fetch("https://mp.speechmatics.com/v1/api_keys?type=rt", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${SPEECHMATICS_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ ttl: RT_TOKEN_TTL_SECONDS }),
-    });
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), RT_TOKEN_TIMEOUT_MS);
+    let res: Response;
+    try {
+      res = await fetch(RT_TOKEN_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${SPEECHMATICS_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ ttl: RT_TOKEN_TTL_SECONDS }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
 
     const raw = await res.text();
 
     if (!res.ok) {
+      if (res.status === 429) {
+        return json({ error: "Speechmatics is rate-limiting requests — try again shortly." }, 503);
+      }
       return json({ error: `Speechmatics token mint failed (${res.status})`, detail: raw.slice(0, 300) }, 502);
     }
 
@@ -100,6 +116,10 @@ Deno.serve(async (req: Request) => {
 
     return json({ token });
   } catch (err) {
+    const name = err instanceof Error ? err.name : "";
+    if (name === "AbortError" || name === "TimeoutError") {
+      return json({ error: "Speechmatics did not respond in time — please try again.", detail: "timeout" }, 504);
+    }
     return json({ error: "Unexpected error minting token", detail: String(err) }, 502);
   }
 });

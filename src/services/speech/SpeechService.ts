@@ -40,6 +40,8 @@ const WS_CONNECT_TIMEOUT_MS = 10_000;
 const START_TIMEOUT_MS = 10_000;
 const BROWSER_START_TIMEOUT_MS = 8_000;
 const FINAL_FLUSH_MS = 350;
+/** Bounded wait for the token function so the UI never hangs on a stalled service. */
+const TOKEN_FETCH_TIMEOUT_MS = 15_000;
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
@@ -127,7 +129,10 @@ function getSupabase(): SupabaseClient {
   return supabase;
 }
 
-/** Mint a fresh short-lived Speechmatics RT JWT via the Edge Function. */
+/** Mint a fresh short-lived Speechmatics RT JWT via the Edge Function.
+ *  Every failure path — a returned error OR a thrown fetch error — is normalized
+ *  to a friendly SpeechError, so raw low-level text like "ReadTimeout" can never
+ *  reach the UI banners or the TTS announcement. */
 async function fetchToken(): Promise<{ token: string; ms: number }> {
   const t0 = performance.now();
   let client: SupabaseClient;
@@ -136,26 +141,44 @@ async function fetchToken(): Promise<{ token: string; ms: number }> {
   } catch (err) {
     throw asSpeechError(err);
   }
-  const { data, error } = await client.functions.invoke<{ token?: string }>("speechmatics-token", {
-    body: {},
-  });
-  const ms = Math.round(performance.now() - t0);
-  if (error) {
-    warnLog("Token fetch failed (status", (error as { context?: { status?: number } }).context?.status ?? "n/a", ")");
+  try {
+    const { data, error } = await client.functions.invoke<{ token?: string }>("speechmatics-token", {
+      body: {},
+      timeout: TOKEN_FETCH_TIMEOUT_MS,
+    });
+    const ms = Math.round(performance.now() - t0);
+    if (error) {
+      const status = (error as { context?: { status?: number } }).context?.status;
+      warnLog("Token fetch failed (status", status ?? "n/a", ")");
+      // 5xx (upstream timeouts, rate limits, function stall) → network-kind so
+      // start() falls back to the browser engine instead of hard-failing.
+      const kind: SpeechErrorKind = status !== undefined && status >= 500 ? "network" : "stt";
+      throw new SpeechError(
+        kind,
+        "Speech recognition is temporarily unavailable. Please try again in a moment.",
+        "TokenError"
+      );
+    }
+    if (!data?.token) {
+      throw new SpeechError(
+        "stt",
+        "Speech recognition is temporarily unavailable — the token service returned no key.",
+        "TokenError"
+      );
+    }
+    return { token: data.token, ms };
+  } catch (err) {
+    // Normalize ANY thrown failure (abort/timeout, network drop, malformed
+    // response). The token step runs before any speech is heard, so treat it as
+    // network-kind to let the browser fallback engine take over downstream.
+    if (err instanceof SpeechError) throw err;
+    warnLog("Token fetch threw:", err instanceof Error ? err.name : typeof err);
     throw new SpeechError(
-      "stt",
-      "Speech recognition is temporarily unavailable. Please try again in a moment.",
+      "network",
+      "Speech recognition is temporarily unavailable — please try again in a moment.",
       "TokenError"
     );
   }
-  if (!data?.token) {
-    throw new SpeechError(
-      "stt",
-      "Speech recognition is temporarily unavailable — the token service returned no key.",
-      "TokenError"
-    );
-  }
-  return { token: data.token, ms };
 }
 
 /* ------------------------------------------------------------------ */
