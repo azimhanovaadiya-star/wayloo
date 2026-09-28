@@ -169,7 +169,7 @@ function locateObject(target: DetectedObject, scene: Scene): Loc {
   const { fy } = centroid(target);
   const cy = h > 0 ? fy / h : 0.5;
 
-  const direction = directionForPosition(target.position, w);
+  const direction = directionForPosition(target, w);
   // Clock: meaningful for left/right (9↔3); for top/bottom the vertical band
   // already says it, for center "directly ahead" carries the meaning.
   const clock =
@@ -390,7 +390,7 @@ function zoneName(zone: "left" | "right" | "above" | "below"): string {
 
 function zoneList(zone: "left" | "right" | "above" | "below", objs: DetectedObject[]): string {
   if (objs.length === 0) return `I don't see anything ${zoneName(zone)} right now.`;
-  const list = joinList(objs.slice(0, 5).map((o) => plural(o.name, 1)));
+  const list = joinList(objs.slice(0, 5).map((o) => `a ${plural(o.name, 1)}`));
   const clock = zone === "left" || zone === "right" ? `around ${zone === "left" ? "9 to 10" : "2 to 3"} o'clock, ` : "";
   return `${zoneName(zone)}${clock ? ", " + clock : ""}there's ${list}.`;
 }

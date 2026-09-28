@@ -22,11 +22,28 @@
  *   echo-monitored). The source MUST be connected to the processor, otherwise
  *   onaudioprocess never receives any microphone samples.
  *
- * Diagnostics — pipeline markers are written to the console with a stable
- * [WAYLO Speech] prefix so the live flow is inspectable:
- *   MIC_PERMISSION_GRANTED, MIC_STREAM_STARTED, AUDIO_CAPTURE_STARTED,
- *   WEBSOCKET_CONNECTED, AUDIO_CHUNK_SENT (dev builds only — too chatty for
- *   prod), TRANSCRIPTION_RECEIVED, TRANSCRIPT_TEXT.
+ * AudioContext lifecycle — WHY it is created in requestPermission() and NOT per
+ * utterance (this is the one thing that silently broke voice):
+ *   An AudioContext starts "suspended" unless it is created (and resumed) inside
+ *   a user gesture. startSpeechmatics() runs an ASYNC sequence (Edge Function →
+ *   WebSocket handshake → RecognitionStarted) before it ever creates audio, by
+ *   which point Chrome's transient activation is gone — so a per-utterance
+ *   `new AudioContext()` stayed suspended, `resume()` was rejected, and
+ *   onaudioprocess NEVER fired → no audio captured, no PCM sent, no error logged,
+ *   Speechmatics heard silence, and the UI fell into "I couldn't hear anything".
+ *   Fix: the context is created and resumed inside the SAME gesture that grants
+ *   microphone permission, kept on the service, and REUSED by every utterance.
+ *   The context is only closed when the app releases the microphone.
+ *
+ * Diagnostics — pipeline markers are written to the console to make every stage
+ * of MICROPHONE → AUDIO → JWT → WEBSOCKET → SPEECHMATICS inspectable:
+ *   [MIC] GETUSERMEDIA_STARTED / PERMISSION_GRANTED / stream tracks & readyState
+ *   [AUDIO] AudioContext rate + state, per-chunk non-zero% / peak (DEV, throttled),
+ *           session-end byte totals — proof that real samples flowed
+ *   [JWT] requesting token → token received (length only — the value is a secret)
+ *   [WS] connecting → connected → message kinds → closed (code/reason)
+ *   [SPEECHMATICS] transcription events → recognized text
+ *   [ERROR] anything that failed, with the stage name
  * No secrets, JWTs, or WebSocket URLs (which embed the JWT) are ever logged.
  */
 
@@ -51,6 +68,12 @@ function log(...parts: unknown[]): void {
 }
 function warnLog(...parts: unknown[]): void {
   console.warn("[WAYLO Speech]", ...parts);
+}
+
+/** Stage-labelled diagnostic: [WAYLO Speech] [MIC] …, [AUDIO] …, [JWT] …,
+ *  [WS] …, [SPEECHMATICS] …, [ERROR] …. */
+function diag(stage: "MIC" | "AUDIO" | "JWT" | "WS" | "SPEECHMATICS" | "ERROR", ...parts: unknown[]): void {
+  console.log(`[WAYLO Speech] [${stage}]`, ...parts);
 }
 
 /* ------------------------------------------------------------------ */
@@ -142,6 +165,7 @@ async function fetchToken(): Promise<{ token: string; ms: number }> {
     throw asSpeechError(err);
   }
   try {
+    diag("JWT", "requesting recognition token from the Edge Function");
     const { data, error } = await client.functions.invoke<{ token?: string }>("speechmatics-token", {
       body: {},
       timeout: TOKEN_FETCH_TIMEOUT_MS,
@@ -149,7 +173,7 @@ async function fetchToken(): Promise<{ token: string; ms: number }> {
     const ms = Math.round(performance.now() - t0);
     if (error) {
       const status = (error as { context?: { status?: number } }).context?.status;
-      warnLog("Token fetch failed (status", status ?? "n/a", ")");
+      warnLog("[JWT] Token fetch failed (status", status ?? "n/a", ")");
       // 5xx (upstream timeouts, rate limits, function stall) → network-kind so
       // start() falls back to the browser engine instead of hard-failing.
       const kind: SpeechErrorKind = status !== undefined && status >= 500 ? "network" : "stt";
@@ -166,13 +190,15 @@ async function fetchToken(): Promise<{ token: string; ms: number }> {
         "TokenError"
       );
     }
+    // Log length/segments ONLY — the token value is a credential and never logged.
+    diag("JWT", `token received in ${ms}ms (${data.token.length} chars, ${data.token.split(".").length} segments)`);
     return { token: data.token, ms };
   } catch (err) {
     // Normalize ANY thrown failure (abort/timeout, network drop, malformed
     // response). The token step runs before any speech is heard, so treat it as
     // network-kind to let the browser fallback engine take over downstream.
     if (err instanceof SpeechError) throw err;
-    warnLog("Token fetch threw:", err instanceof Error ? err.name : typeof err);
+    warnLog("[JWT] Token fetch threw:", err instanceof Error ? err.name : typeof err);
     throw new SpeechError(
       "network",
       "Speech recognition is temporarily unavailable — please try again in a moment.",
@@ -208,11 +234,27 @@ function makeResampler(srcRate: number): (input: Float32Array) => Int16Array {
 /** Verify a live mic stream is actually usable before streaming begins. */
 function logMicStream(stream: MediaStream, label: string): void {
   const tracks = stream.getAudioTracks();
-  log(label, `— ${tracks.length} audio track(s)`);
+  diag("MIC", label, `— ${tracks.length} audio track(s)`);
   for (const track of tracks) {
-    log(
+    diag(
+      "MIC",
       `  track: readyState=${track.readyState} enabled=${track.enabled} muted=${track.muted} label="${track.label}"`
     );
+  }
+}
+
+/** Report the browser's permission-store state for the mic (best-effort). */
+async function logMicPermissionState(): Promise<void> {
+  try {
+    const nav = navigator as Navigator & {
+      permissions?: { query: (d: { name: string }) => Promise<{ state: string }> };
+    };
+    if (nav.permissions?.query) {
+      const s = await nav.permissions.query({ name: "microphone" });
+      diag("MIC", `permission store state: "${s.state}" (prompt/granted/denied)`);
+    }
+  } catch {
+    /* Permissions API not available (some browsers) — skip silently */
   }
 }
 
@@ -221,15 +263,16 @@ async function getMicStream(): Promise<MediaStream> {
     throw new SpeechError("unavailable", "Microphone access is not supported in this browser.", "NotSupportedError");
   }
   try {
+    diag("MIC", "GETUSERMEDIA_STARTED — requesting microphone (audio: mono, echoCancellation, noiseSuppression)");
     const stream = await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
     });
-    log("MIC_PERMISSION_GRANTED — Microphone permission granted");
-    logMicStream(stream, "MIC_STREAM_STARTED — Microphone stream started");
+    diag("MIC", "PERMISSION_GRANTED — Microphone permission granted");
+    logMicStream(stream, "STREAM_STARTED — Microphone stream started");
     return stream;
   } catch (err) {
     const name = err instanceof DOMException ? err.name : err instanceof Error ? err.name : "UnknownError";
-    warnLog("Microphone access failed:", name);
+    diag("ERROR", `Microphone access failed: ${name}`);
     throw new SpeechError(micFailureKind(name), micFailureMessage(name), name);
   }
 }
@@ -401,6 +444,59 @@ export class SpeechService {
   /** Mic stream acquired via requestPermission() and reused across STT sessions
    *  so the browser permission prompt appears exactly once per app session. */
   private heldStream: MediaStream | null = null;
+  /** One AudioContext for the whole app session, created+resumed inside the
+   *  USER GESTURE that granted the mic (see module doc — why this exists). */
+  private audioCtx: AudioContext | null = null;
+
+  /** Create (once) or reuse the shared AudioContext. See the module docs: creating
+   *  it per utterance — after the async token/WebSocket work — left it suspended
+   *  and silently killed the microphone path, because onaudioprocess only fires
+   *  on a RUNNING context and Chrome refuses resume() without a fresh user
+   *  gesture. Called inside requestPermission() (a user gesture) so the context
+   *  starts running then and is reused by every subsequent utterance. */
+  private async warmAudioContext(): Promise<AudioContext> {
+    let ctx = this.audioCtx;
+    if (!ctx) {
+      const Ctor =
+        window.AudioContext ??
+        (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+      if (!Ctor) {
+        throw new SpeechError("unavailable", "This browser can't capture audio input.", "NotSupportedError");
+      }
+      ctx = new Ctor();
+      this.audioCtx = ctx;
+      diag("AUDIO", "AudioContext created", `(hardware rate ${ctx.sampleRate} Hz → ${TARGET_RATE} Hz stream)`);
+    }
+    // TS narrows ctx.state as we go ("running" already returned, "suspended"
+    // handled), but resume() can genuinely move the runtime state to "running".
+    // Re-read through a full-union cast so every branch of the state machine is
+    // a real runtime check, not one TS has proven impossible.
+    if ((ctx.state as AudioContextState) === "running") {
+      diag("AUDIO", "AudioContext running — audio capture path live");
+      return ctx;
+    }
+    if ((ctx.state as AudioContextState) === "suspended") {
+      diag("AUDIO", "AudioContext is suspended — attempting resume() (needs a recent user gesture)");
+      try {
+        await ctx.resume();
+      } catch (err) {
+        diag("ERROR", "AudioContext resume() rejected:", err instanceof Error ? err.name : String(err));
+      }
+    }
+    if ((ctx.state as AudioContextState) !== "running") {
+      diag(
+        "ERROR",
+        `AudioContext did not start (state=${ctx.state}). No mic audio will be captured or sent. ` +
+          "Re-run from a tap/click — the browser blocks suspended audio contexts outside a user gesture."
+      );
+      throw new SpeechError(
+        "stt",
+        "Your browser blocked the audio channel — tap the mic button again and speak.",
+        "AudioContextBlockedError"
+      );
+    }
+    return ctx;
+  }
 
   get active(): boolean {
     return this.session !== null && !this.session.tornDown;
@@ -415,9 +511,22 @@ export class SpeechService {
 
   /** Explicitly acquire microphone permission BEFORE any speech-to-text call.
    *  Must run from a user gesture so the browser shows its permission dialog;
-   *  the UI explains why WAYLO needs the mic before invoking this. */
+   *  the UI explains why WAYLO needs the mic before invoking this. The
+   *  AudioContext is warmed in the SAME gesture so it can never silently end up
+   *  suspended on a later utterance. */
   async requestPermission(): Promise<void> {
-    if (this.micPermissionHeld) return;
+    // Warm the audio context BEFORE the async getUserMedia, inside the gesture.
+    // If the browser still refuses, start() retries inside the listen gesture.
+    try {
+      await this.warmAudioContext();
+    } catch {
+      /* retried at start() */
+    }
+    void logMicPermissionState();
+    if (this.micPermissionHeld) {
+      diag("MIC", "permission already held — reusing live stream");
+      return;
+    }
     try {
       this.heldStream = await getMicStream();
     } catch (err) {
@@ -426,7 +535,7 @@ export class SpeechService {
         // A few devices reject specific audio constraints — fall back to defaults.
         try {
           this.heldStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-          log("MIC_PERMISSION_GRANTED — Microphone permission granted (default constraints)");
+          diag("MIC", "PERMISSION_GRANTED — Microphone permission granted (default constraints)");
           return;
         } catch {
           /* fall through to re-throw the original error */
@@ -436,11 +545,21 @@ export class SpeechService {
     }
   }
 
-  /** Stop and drop the held mic stream (app session ending). */
+  /** Stop and drop the held mic stream + the shared audio context (app session
+   *  ending). The context is closed here, not per utterance. */
   releasePermission(): void {
-    if (!this.heldStream) return;
-    this.heldStream.getTracks().forEach((t) => t.stop());
-    this.heldStream = null;
+    if (this.heldStream) {
+      this.heldStream.getTracks().forEach((t) => t.stop());
+      this.heldStream = null;
+    }
+    if (this.audioCtx && this.audioCtx.state !== "closed") {
+      try {
+        void this.audioCtx.close().catch(() => undefined);
+      } catch {
+        /* noop */
+      }
+      this.audioCtx = null;
+    }
   }
 
   async start(opts: StartOptions): Promise<void> {
@@ -456,7 +575,7 @@ export class SpeechService {
       const first = asSpeechError(err);
       // Mic-level failures are final — no engine can work around them.
       if (first.kind === "permission" || first.kind === "unavailable") throw first;
-      warnLog("Speechmatics path failed before any speech —", first.message);
+      warnLog("[ERROR] Speechmatics path failed before any speech —", first.message);
       if (!browserSpeechSupported()) throw first;
     }
 
@@ -483,27 +602,28 @@ export class SpeechService {
   /* ---------------- Speechmatics (primary) ---------------- */
 
   private async startSpeechmatics(opts: StartOptions): Promise<SpeechmaticsSession> {
-    const { token } = await fetchToken(); // never logged
-    const startedAt = performance.now();
+    const { token, ms } = await fetchToken(); // token value never logged
+    diag("JWT", `token OK (${ms}ms) — opening WebSocket (region eu)`);
 
-    log("Fetching recognition token OK — opening WebSocket");
-    const ws = new WebSocket(`${WS_ENDPOINT}?jwt=${token}`);
+    const startedAt = performance.now();
+    const ws = new WebSocket(`${WS_ENDPOINT}?jwt=${token}`); // URL never logged with the JWT
     ws.binaryType = "arraybuffer";
+    diag("WS", `connecting to ${WS_ENDPOINT.replace("wss://", "")} (readyState=${ws.readyState})`);
 
     // Wait for the socket to open…
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
-        warnLog("WebSocket connect timed out — verify the Speechmatics region matches your API key");
+        warnLog("[WS] WebSocket connect timed out — verify the Speechmatics region matches your API key");
         reject(new SpeechError("network", "Could not reach the speech service.", "NetworkError"));
       }, WS_CONNECT_TIMEOUT_MS);
       ws.onopen = () => {
         clearTimeout(timer);
-        log("WEBSOCKET_CONNECTED — Speech recognition service reached");
+        diag("WS", "CONNECTED — handshake OK (speech service reached)");
         resolve();
       };
       ws.onerror = () => {
         clearTimeout(timer);
-        warnLog("WebSocket connection failed before it opened");
+        diag("ERROR", "WebSocket connection failed before it opened (see browser network/console for the real cause)");
         reject(new SpeechError("network", "Could not reach the speech service.", "NetworkError"));
       };
     });
@@ -532,14 +652,15 @@ export class SpeechService {
           return;
         }
         const kind = typeof msg.message === "string" ? msg.message : "";
+        diag("WS", "message:", kind);
         if (kind === "RecognitionStarted") {
           recognitionStarted = true;
-          log("RecognitionStarted — Listening…");
+          diag("SPEECHMATICS", "LISTENING — pending microphone audio");
           done();
           return;
         }
         if (kind === "Error") {
-          warnLog("Speechmatics start error:", errorDetail(msg));
+          warnLog("[SPEECHMATICS] start error:", errorDetail(msg));
           fail(new SpeechError("network", "The speech service couldn't start.", "SpeechmaticsError"));
           try {
             ws.close();
@@ -549,6 +670,7 @@ export class SpeechService {
         }
       };
     });
+    diag("WS", "sending start-recognition (pcm_s16le", `${TARGET_RATE} Hz, language ${STT_LANGUAGE})`);
     ws.send(
       JSON.stringify({
         type: "start-recognition",
@@ -558,12 +680,18 @@ export class SpeechService {
     );
     await opened;
 
+    // AudioContext: shared, created back in the permission gesture. If something
+    // closed it since (or it never started), fail loudly instead of silently
+    // capturing nothing (see module doc).
+    const ctx = await this.warmAudioContext();
+    diag("AUDIO", "AUDIO_CAPTURE_STARTED — audio capture path active");
+
     // Only now touch the microphone: reuse the held permission stream when
     // present (never prompt twice in one app session).
     let stream: MediaStream;
     try {
       stream = this.heldStream ?? (this.heldStream = await getMicStream());
-      logMicStream(stream, "MIC_STREAM_STARTED — Microphone stream started");
+      logMicStream(stream, "STREAM_STARTED — Microphone stream started");
     } catch (err) {
       try {
         ws.close();
@@ -572,16 +700,7 @@ export class SpeechService {
       }
       throw err;
     }
-
-    const Ctor =
-      window.AudioContext ??
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const ctx = new Ctor();
-    await ctx.resume();
-    log(
-      "AUDIO_CAPTURE_STARTED — Audio capture started",
-      `(${ctx.sampleRate} Hz → ${TARGET_RATE} Hz stream)`
-    );
+    diag("AUDIO", `started microphone capture at ${ctx.sampleRate} Hz (resampled to ${TARGET_RATE} Hz PCM16)`);
 
     // Build the muted audio graph. CRITICAL: the MediaStreamSourceNode is kept
     // and connected to the ScriptProcessor, otherwise onaudioprocess never fires.
@@ -614,13 +733,13 @@ export class SpeechService {
           s.endedSent = true;
           try {
             s.ws.send(JSON.stringify({ type: "end-of-stream" }));
-            log("end-of-stream sent — flushing final transcript");
+            diag("WS", "end-of-stream sent — flushing final transcript");
           } catch {
             /* noop */
           }
         }
         await sleep(FINAL_FLUSH_MS);
-        // Audio graph + mic teardown.
+        // Audio graph + mic teardown (the shared AudioContext stays open).
         if (s.stream !== this.heldStream) s.stream.getTracks().forEach((t) => t.stop());
         try {
           s.source.disconnect();
@@ -633,7 +752,20 @@ export class SpeechService {
         } catch {
           /* noop */
         }
-        void s.ctx.close().catch(() => undefined);
+        diag(
+          "AUDIO",
+          `session stopped — ${audioChunks} audio chunk(s), ${audioBytes} byte(s) PCM16 sent; ` +
+            `last chunk non-zero ${(lastNonzeroFrac * 100).toFixed(0)}%, peak ${lastPeak.toFixed(3)}`
+        );
+        if (audioChunks === 0) {
+          diag(
+            "ERROR",
+            "NO AUDIO WAS EVER SENT — onaudioprocess produced zero chunks. " +
+              "Check the browser's audio-device, permissions and that the page was opened by a click/tap."
+          );
+        } else if (audioNonzero === 0) {
+          diag("ERROR", "Audio reached the websocket but was ALL SILENT (zero non-zero samples). Check the mic device/routing.");
+        }
         try {
           if (s.ws.readyState === WebSocket.OPEN || s.ws.readyState === WebSocket.CONNECTING) s.ws.close();
         } catch {
@@ -643,6 +775,19 @@ export class SpeechService {
         opts.onEvent({ type: "ended" });
       },
     };
+
+    // Per-session audio counters (evidence the user asked for):
+    //  - chunk  = one ScriptProcessor callback (bufferSize 4096, ~85 ms at 48kHz);
+    //  - nonZero = fraction of PCM samples that are not silence;
+    //  - peak   = loudest sample, 0..1 (0.5+ means real speech-level volume);
+    //  -	byte counters feed the end-of-session summary above.
+    let chunkCount = 0;
+    let bytesSent = 0;
+    let audioChunks = 0;
+    let audioBytes = 0;
+    let audioNonzero = 0; // running count of non-zero PCM samples
+    let lastNonzeroFrac = 0;
+    let lastPeak = 0;
 
     // Make the session authoritative immediately, then run the live handlers.
     this.session = session;
@@ -658,12 +803,13 @@ export class SpeechService {
         return;
       }
       const kind = typeof msg.message === "string" ? msg.message : "";
+      diag("WS", "message:", kind);
       switch (kind) {
         case "AddPartialTranscript": {
           const text = transcriptOf(msg);
           if (text) {
             s.gotAnything = true;
-            log(`TRANSCRIPTION_RECEIVED (interim): "${text}"`);
+            diag("SPEECHMATICS", `ADD_PARTIAL_TRANSCRIPT: "${text}"`);
             opts.onEvent({ type: "partial", text });
           }
           break;
@@ -672,7 +818,7 @@ export class SpeechService {
           const text = transcriptOf(msg);
           if (text) {
             s.gotAnything = true;
-            log(`TRANSCRIPT_TEXT: "${text}"`);
+            diag("SPEECHMATICS", `RECOGNIZED: "${text}"`);
             log(`Transcript: "${text}"`);
             const durationMs = Math.max(0, Math.round(performance.now() - s.startedAt));
             opts.onEvent({ type: "final", text, durationMs });
@@ -685,7 +831,7 @@ export class SpeechService {
           void s.stop();
           break;
         case "Error": {
-          warnLog("Speechmatics runtime error:", errorDetail(msg));
+          warnLog("[SPEECHMATICS] runtime error:", errorDetail(msg));
           opts.onEvent({
             type: "error",
             message: "The speech service reported a problem. Please try again.",
@@ -699,10 +845,10 @@ export class SpeechService {
       }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
       const s = session;
       if (s && !s.tornDown) {
-        log("WebSocket closed");
+        diag("WS", `closed code=${ev.code}`, ev.reason ? `reason="${ev.reason}"` : "(no reason)");
         this.teardown(s);
       }
     };
@@ -711,10 +857,38 @@ export class SpeechService {
       const s = session;
       if (!s || s.tornDown || !recognitionStarted) return;
       if (s.ws.readyState !== WebSocket.OPEN) return;
-      const pcm = resample(e.inputBuffer.getChannelData(0));
+      const input = e.inputBuffer.getChannelData(0);
+      const pcm = resample(input);
       if (pcm.length === 0) return;
+      // Proof-of-life: measure how much of this chunk is actual sound vs silence,
+      // and how loud the loudest sample is.
+      let nonzero = 0;
+      let peak = 0;
+      for (let i = 0; i < pcm.length; i++) {
+        const v = pcm[i];
+        if (v !== 0) nonzero++;
+        const a = v < 0 ? -v : v;
+        if (a > peak) peak = a;
+      }
+      const nonzeroFrac = pcm.length > 0 ? nonzero / pcm.length : 0;
       s.ws.send(pcm.buffer as ArrayBuffer);
-      if (import.meta.env.DEV) log("AUDIO_CHUNK_SENT — PCM chunk (bytes:", pcm.byteLength, ")");
+      chunkCount++;
+      bytesSent += pcm.byteLength;
+      audioChunks = chunkCount;
+      audioBytes = bytesSent;
+      audioNonzero += nonzero;
+      lastNonzeroFrac = nonzeroFrac;
+      lastPeak = peak;
+      if (import.meta.env.DEV && chunkCount % 12 === 0) {
+        // ~once a second at 48 kHz — loud enough to SEE the voice, quiet enough
+        // not to drown the console.
+        diag(
+          "AUDIO",
+          `chunk #${chunkCount}: ${input.length} samples in → ${pcm.length} PCM16 @16kHz ` +
+            `(non-zero ${(nonzeroFrac * 100).toFixed(0)}%, peak ${peak.toFixed(3)}, ` +
+            `${bytesSent} bytes total sent)`
+        );
+      }
     };
 
     // Timing gates: silent-gap flush + hard utterance cap.
@@ -756,7 +930,7 @@ export class SpeechService {
     // The held mic stream (if any) is only inspected for diagnostics — the
     // browser captures its own audio.
     if (this.heldStream) {
-      logMicStream(this.heldStream, "MIC_STREAM_STARTED — Microphone stream available");
+      logMicStream(this.heldStream, "STREAM_STARTED — Microphone stream available");
     }
 
     const recognition = new Ctor();
@@ -794,7 +968,7 @@ export class SpeechService {
       recognition.onstart = () => {
         startedFlag = true;
         clearTimeout(timer);
-        log("Speech recognition started (Web Speech) — Listening…");
+        diag("WS", "browser engine started (Web Speech) — Listening…");
         opts.onEvent({ type: "started" });
         resolve();
       };
@@ -803,7 +977,7 @@ export class SpeechService {
         if (session.tornDown && code === "aborted") return; // user stopped — not an error
         if (code === "aborted") return;
         const mapped = webSpeechErrName(code);
-        warnLog("Web Speech error:", code, "—", mapped.message);
+        warnLog("[SPEECHMATICS] web-Speech error:", code, "—", mapped.message);
         if (!startedFlag) {
           clearTimeout(timer);
           reject(new SpeechError(mapped.kind, mapped.message, mapped.name));
@@ -837,7 +1011,7 @@ export class SpeechService {
 
       if (finalText) {
         session.speechSeen = true;
-        log(`TRANSCRIPTION_RECEIVED → TRANSCRIPT_TEXT: "${finalText}"`);
+        diag("SPEECHMATICS", `RECOGNIZED (fallback): "${finalText}"`);
         log(`Transcript: "${finalText}"`);
         const durationMs = Math.max(0, Math.round(performance.now() - session.startedAt));
         opts.onEvent({ type: "final", text: finalText, durationMs });
@@ -847,7 +1021,7 @@ export class SpeechService {
       }
       if (interim) {
         session.speechSeen = true;
-        log(`TRANSCRIPTION_RECEIVED (interim): "${interim}"`);
+        diag("SPEECHMATICS", `ADD_PARTIAL_TRANSCRIPT (fallback): "${interim}"`);
         opts.onEvent({ type: "partial", text: interim });
       }
     };

@@ -1,7 +1,12 @@
 /**
  * Unit tests for the Reasoning Engine (PRD §Testing): intent classification,
- * find-object (incl. honest miss), context resolution, and the no-hallucination
- * hard rule.
+ * find-object (incl. honest miss), context resolution, spatial relationships,
+ * zone questions, and the no-hallucination hard rule.
+ *
+ * Fixtures always carry real frame dimensions (1240×702) so every spatial claim
+ * is deterministic: direction comes from the position band, the clock phrase
+ * from the box centroid against the frame, and "below/left-of" relations from
+ * the boxes themselves — nothing is invented.
  */
 
 import { describe, expect, it } from "vitest";
@@ -14,9 +19,16 @@ import {
 } from "./ReasoningEngine";
 import type { DetectedObject, Scene, WayloTurn } from "../../types";
 
+const FIXTURE_W = 1240;
+const FIXTURE_H = 896;
+
+/** [name, boxX, area] — box spans [boxX, 100, boxX+100, 300] with a centroid at
+ *  height 200 (frame-middle, so no vertical depth clause pollutes assertions). */
 function sceneWith(objects: Array<[string, number, number]>): Scene {
   return {
     timestamp: new Date().toISOString(),
+    frameWidth: FIXTURE_W,
+    frameHeight: FIXTURE_H,
     objects: objects.map(([name, cx, area]) => ({
       name,
       confidence: 0.9,
@@ -79,7 +91,7 @@ describe("canonicalForWord + resolveObjects", () => {
 
 describe("honesty rules — never invent objects", () => {
   it("find-object miss is honest and says no location", () => {
-    const scene = sceneWith([["table", 450, 5000]]);
+    const scene = sceneWith([["table", 500, 5000]]);
     const r = synthesizeResponse("Where is my phone?", scene);
     expect(r.isMiss).toBe(true);
     expect(r.text).toContain("can't see");
@@ -104,15 +116,16 @@ describe("honesty rules — never invent objects", () => {
 });
 
 describe("find-object happy path", () => {
-  it("tells the direction of a found object", () => {
+  it("tells the direction (+ clock) of a found object", () => {
     const scene = sceneWith([
       ["phone", 100, 300],
       ["table", 500, 5000],
     ]);
     const r = synthesizeResponse("Where is my phone?", scene);
     expect(r.isMiss).toBe(false);
-    expect(r.text.toLowerCase()).toContain("phone");
-    expect(r.text.toLowerCase()).toContain("left");
+    expect(r.text).toContain("phone");
+    expect(r.text).toContain("left");
+    expect(r.text).toMatch(/Your phone is on your left, around 10 o'clock/);
   });
 });
 
@@ -130,8 +143,8 @@ describe("context — follow-up questions", () => {
       at: new Date().toISOString(),
     };
     const r = synthesizeResponse("Where is it, exactly?", scene, { history: [prior] });
-    expect(r.text.toLowerCase()).toContain("bottle");
     expect(r.isMiss).toBe(false);
+    expect(r.text).toContain("bottle");
   });
 });
 
@@ -149,26 +162,27 @@ describe("natural, non-repetitive scene descriptions", () => {
       ["keyboard", 480, 5000],
     ]);
     const r = synthesizeResponse("What's in front of me?", scene);
-    expect(r.text).toBe("There's a laptop and a keyboard directly in front of you.");
-    expect(r.text.match(/in front of you/g)).toHaveLength(1);
+    expect(r.text).toBe("There's a laptop and a keyboard directly ahead.");
+    expect(r.text.match(/directly ahead/g)).toHaveLength(1);
   });
-  it("never repeats 'straight ahead of you' per object", () => {
+  it("never repeats 'directly ahead' per object in a fuller view", () => {
     const scene = sceneWith([
       ["laptop", 440, 9000],
       ["keyboard", 470, 5000],
       ["mouse", 460, 2000],
     ]);
     const r = synthesizeResponse("Describe what you see", scene);
+    expect(r.text).toBe("There's a laptop, a keyboard and a mouse directly ahead.");
     expect(r.text.match(/straight ahead of you/g) ?? []).toHaveLength(0);
-    expect(r.text.match(/directly in front of you/g)).toHaveLength(1);
+    expect(r.text.match(/directly ahead/g)).toHaveLength(1);
   });
-  it("names each direction once across groups", () => {
+  it("names each direction once across groups, joined with 'and'", () => {
     const scene = sceneWith([
       ["table", 450, 5000],
       ["chair", 700, 4000],
     ]);
     const r = synthesizeResponse("What's in front of me?", scene);
-    expect(r.text).toBe("There's a table directly in front of you, and a chair on your right.");
+    expect(r.text).toBe("There's a table directly ahead, and there's a chair slightly to your right.");
   });
   it("answers a side-specific question with only that side", () => {
     const scene = sceneWith([
@@ -190,7 +204,7 @@ describe("natural, non-repetitive scene descriptions", () => {
     const scene = sceneWith([["laptop", 450, 9000]]);
     const r = synthesizeResponse("What's in front of me?", scene);
     expect(r.text.toLowerCase()).toMatch(/^(?!.*(silver|wooden|desk|leather|black|sitting)).*/);
-    expect(r.text).toBe("There's a laptop directly in front of you.");
+    expect(r.text).toBe("There's a laptop directly ahead.");
   });
 });
 
@@ -200,7 +214,7 @@ describe("polar yes/no answers", () => {
     const r = synthesizeResponse("Is there a laptop?", scene);
     expect(r.text.startsWith("Yes")).toBe(true);
     expect(r.text).toContain("laptop");
-    expect(r.text).toContain("in front of you");
+    expect(r.text).toContain("directly ahead");
   });
   it("says no without a tour when the object is absent", () => {
     const scene = sceneWith([["table", 450, 5000]]);
@@ -214,6 +228,8 @@ describe("grounded relative positions", () => {
   it("says 'below the laptop' when the box is genuinely lower and overlapping", () => {
     const scene: Scene = {
       timestamp: new Date().toISOString(),
+      frameWidth: 800,
+      frameHeight: 600,
       objects: [
         { name: "laptop", confidence: 0.92, bbox: [300, 100, 500, 300], position: "center", area: 40000 },
         { name: "keyboard", confidence: 0.88, bbox: [320, 320, 480, 420], position: "center", area: 16000 },
@@ -222,12 +238,14 @@ describe("grounded relative positions", () => {
       modelLabel: "test",
     };
     const r = synthesizeResponse("Where is the keyboard?", scene);
-    expect(r.text).toBe("The keyboard is directly in front of you, below the laptop.");
+    expect(r.text).toBe("The keyboard is directly ahead, below the laptop.");
     expect(r.referencedObjects.map((o: DetectedObject) => o.name)).toContain("laptop");
   });
   it("does not claim a below-relation without horizontal overlap", () => {
     const scene: Scene = {
       timestamp: new Date().toISOString(),
+      frameWidth: 800,
+      frameHeight: 600,
       objects: [
         { name: "laptop", confidence: 0.92, bbox: [100, 100, 300, 300], position: "left", area: 40000 },
         { name: "keyboard", confidence: 0.88, bbox: [500, 320, 700, 420], position: "right", area: 16000 },
